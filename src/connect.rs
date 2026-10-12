@@ -10,7 +10,7 @@ use std::{
     net::SocketAddr,
     rc::Rc,
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 use thiserror::Error;
 use tokio::{
@@ -42,6 +42,13 @@ pub(crate) enum LanMouseConnectionError {
 }
 
 const DEFAULT_CONNECTION_TIMEOUT: Duration = Duration::from_secs(5);
+/// how often connected clients are pinged
+const PING_INTERVAL: Duration = Duration::from_millis(500);
+/// a client that has not answered a ping for this long is disconnected
+const PONG_TIMEOUT: Duration = Duration::from_millis(1500);
+
+/// when each connected address last answered a ping
+type LastPong = Rc<RefCell<HashMap<SocketAddr, Instant>>>;
 
 async fn connect(
     addr: SocketAddr,
@@ -92,14 +99,21 @@ async fn connect_any(
     }
 }
 
+pub(crate) enum ConnectionEvent {
+    /// an event was received from a client
+    Event(ClientHandle, ProtoEvent),
+    /// the connection to a client was lost
+    Disconnected(ClientHandle),
+}
+
 pub(crate) struct LanMouseConnection {
     cert: Certificate,
     client_manager: ClientManager,
     conns: Rc<Mutex<HashMap<SocketAddr, Arc<dyn Conn + Send + Sync>>>>,
     connecting: Rc<Mutex<HashSet<ClientHandle>>>,
-    recv_rx: Receiver<(ClientHandle, ProtoEvent)>,
-    recv_tx: Sender<(ClientHandle, ProtoEvent)>,
-    ping_response: Rc<RefCell<HashSet<SocketAddr>>>,
+    recv_rx: Receiver<ConnectionEvent>,
+    recv_tx: Sender<ConnectionEvent>,
+    last_pong: LastPong,
 }
 
 impl LanMouseConnection {
@@ -112,12 +126,42 @@ impl LanMouseConnection {
             connecting: Default::default(),
             recv_rx,
             recv_tx,
-            ping_response: Default::default(),
+            last_pong: Default::default(),
         }
     }
 
-    pub(crate) async fn recv(&mut self) -> (ClientHandle, ProtoEvent) {
+    pub(crate) async fn recv(&mut self) -> ConnectionEvent {
         self.recv_rx.recv().await.expect("channel closed")
+    }
+
+    /// whether `handle` is connected and accepts input
+    pub(crate) async fn is_ready(&self, handle: ClientHandle) -> bool {
+        let connected = match self.client_manager.active_addr(handle) {
+            Some(addr) => self.conns.lock().await.contains_key(&addr),
+            None => false,
+        };
+        connected && self.client_manager.alive(handle)
+    }
+
+    /// operating system of `handle` as announced via discovery, e.g. `macos`
+    pub(crate) fn peer_os(&self, handle: ClientHandle) -> Option<String> {
+        self.client_manager.peer_os(handle)
+    }
+
+    /// start connecting to `handle` in the background, unless already trying
+    pub(crate) async fn connect(&self, handle: ClientHandle) {
+        let mut connecting = self.connecting.lock().await;
+        if connecting.insert(handle) {
+            spawn_local(connect_to_handle(
+                self.client_manager.clone(),
+                self.cert.clone(),
+                handle,
+                self.conns.clone(),
+                self.connecting.clone(),
+                self.recv_tx.clone(),
+                self.last_pong.clone(),
+            ));
+        }
     }
 
     pub(crate) async fn send(
@@ -140,7 +184,14 @@ impl LanMouseConnection {
                     Ok(_) => {}
                     Err(e) => {
                         log::warn!("client {handle} failed to send: {e}");
-                        disconnect(&self.client_manager, handle, addr, &self.conns).await;
+                        disconnect(
+                            &self.client_manager,
+                            handle,
+                            addr,
+                            &self.conns,
+                            &self.recv_tx,
+                        )
+                        .await;
                     }
                 }
                 log::trace!("{event} >->->->->- {addr}");
@@ -148,21 +199,7 @@ impl LanMouseConnection {
             }
         }
 
-        // check if we are already trying to connect
-        let mut connecting = self.connecting.lock().await;
-        if !connecting.contains(&handle) {
-            connecting.insert(handle);
-            // connect in the background
-            spawn_local(connect_to_handle(
-                self.client_manager.clone(),
-                self.cert.clone(),
-                handle,
-                self.conns.clone(),
-                self.connecting.clone(),
-                self.recv_tx.clone(),
-                self.ping_response.clone(),
-            ));
-        }
+        self.connect(handle).await;
         Err(LanMouseConnectionError::NotConnected)
     }
 }
@@ -173,8 +210,8 @@ async fn connect_to_handle(
     handle: ClientHandle,
     conns: Rc<Mutex<HashMap<SocketAddr, Arc<dyn Conn + Send + Sync>>>>,
     connecting: Rc<Mutex<HashSet<ClientHandle>>>,
-    tx: Sender<(ClientHandle, ProtoEvent)>,
-    ping_response: Rc<RefCell<HashSet<SocketAddr>>>,
+    tx: Sender<ConnectionEvent>,
+    last_pong: LastPong,
 ) -> Result<(), LanMouseConnectionError> {
     log::info!("client {handle} connecting ...");
     // sending did not work, figure out active conn.
@@ -212,7 +249,7 @@ async fn connect_to_handle(
         }
 
         // poll connection for active
-        spawn_local(ping_pong(addr, conn.clone(), ping_response.clone()));
+        spawn_local(ping_pong(addr, conn.clone(), last_pong.clone()));
 
         // receiver
         spawn_local(receive_loop(
@@ -222,7 +259,7 @@ async fn connect_to_handle(
             conn,
             conns,
             tx,
-            ping_response.clone(),
+            last_pong.clone(),
         ));
         return Ok(());
     }
@@ -230,28 +267,30 @@ async fn connect_to_handle(
     Err(LanMouseConnectionError::NotConnected)
 }
 
-async fn ping_pong(
-    addr: SocketAddr,
-    conn: Arc<dyn Conn + Send + Sync>,
-    ping_response: Rc<RefCell<HashSet<SocketAddr>>>,
-) {
+async fn ping_pong(addr: SocketAddr, conn: Arc<dyn Conn + Send + Sync>, last_pong: LastPong) {
+    // the handshake just succeeded, so the client counts as responsive
+    last_pong.borrow_mut().insert(addr, Instant::now());
     loop {
         let (buf, len) = ProtoEvent::Ping.into();
-
-        // send 4 pings, at least one must be answered
-        for _ in 0..4 {
-            if let Err(e) = conn.send(&buf[..len]).await {
-                log::warn!("{addr}: send error `{e}`, closing connection");
-                let _ = conn.close().await;
-                break;
-            }
-            log::trace!("PING >->->->->- {addr}");
-
-            tokio::time::sleep(Duration::from_millis(500)).await;
+        if let Err(e) = conn.send(&buf[..len]).await {
+            log::warn!("{addr}: send error `{e}`, closing connection");
+            let _ = conn.close().await;
+            return;
         }
+        log::trace!("PING >->->->->- {addr}");
 
-        if !ping_response.borrow_mut().remove(&addr) {
-            log::warn!("{addr} did not respond, closing connection");
+        tokio::time::sleep(PING_INTERVAL).await;
+
+        // close as soon as the client has been silent for too long, so a
+        // client that vanished hands the mouse back within ~2 seconds
+        let silent_for = last_pong
+            .borrow()
+            .get(&addr)
+            .map(|pong| pong.elapsed())
+            .unwrap_or(PONG_TIMEOUT);
+        if silent_for >= PONG_TIMEOUT {
+            log::warn!("{addr} did not respond for {silent_for:.1?}, closing connection");
+            last_pong.borrow_mut().remove(&addr);
             let _ = conn.close().await;
             return;
         }
@@ -264,8 +303,8 @@ async fn receive_loop(
     addr: SocketAddr,
     conn: Arc<dyn Conn + Send + Sync>,
     conns: Rc<Mutex<HashMap<SocketAddr, Arc<dyn Conn + Send + Sync>>>>,
-    tx: Sender<(ClientHandle, ProtoEvent)>,
-    ping_response: Rc<RefCell<HashSet<SocketAddr>>>,
+    tx: Sender<ConnectionEvent>,
+    last_pong: LastPong,
 ) {
     let mut buf = [0u8; MAX_EVENT_SIZE];
     while conn.recv(&mut buf).await.is_ok() {
@@ -276,12 +315,14 @@ async fn receive_loop(
                     ProtoEvent::Pong(b) => {
                         client_manager.set_active_addr(handle, Some(addr));
                         client_manager.set_alive(handle, b);
-                        ping_response.borrow_mut().insert(addr);
+                        last_pong.borrow_mut().insert(addr, Instant::now());
                     }
                     ProtoEvent::Hello { commit } => {
                         client_manager.set_peer_commit(handle, Some(commit));
                     }
-                    event => tx.send((handle, event)).expect("channel closed"),
+                    event => tx
+                        .send(ConnectionEvent::Event(handle, event))
+                        .expect("channel closed"),
                 }
             }
             // Skip undecodable datagrams without dropping the
@@ -292,7 +333,7 @@ async fn receive_loop(
         }
     }
     log::warn!("recv error");
-    disconnect(&client_manager, handle, addr, &conns).await;
+    disconnect(&client_manager, handle, addr, &conns, &tx).await;
 }
 
 async fn disconnect(
@@ -300,11 +341,16 @@ async fn disconnect(
     handle: ClientHandle,
     addr: SocketAddr,
     conns: &Mutex<HashMap<SocketAddr, Arc<dyn Conn + Send + Sync>>>,
+    tx: &Sender<ConnectionEvent>,
 ) {
     log::warn!("client ({handle}) @ {addr} connection closed");
     conns.lock().await.remove(&addr);
     client_manager.set_active_addr(handle, None);
     client_manager.set_peer_commit(handle, None);
+    // unknown until the next connection answers a ping
+    client_manager.set_alive(handle, false);
     let active: Vec<SocketAddr> = conns.lock().await.keys().copied().collect();
     log::info!("active connections: {active:?}");
+    tx.send(ConnectionEvent::Disconnected(handle))
+        .expect("channel closed");
 }

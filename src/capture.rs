@@ -1,5 +1,6 @@
 use std::{
     cell::{Cell, RefCell},
+    collections::{HashMap, HashSet},
     rc::Rc,
     time::{Duration, Instant},
 };
@@ -8,13 +9,24 @@ use futures::StreamExt;
 use input_capture::{
     CaptureError, CaptureEvent, CaptureHandle, InputCapture, InputCaptureError, Position,
 };
-use input_event::{Event, KeyboardEvent, scancode};
+use input_event::{Event, KeyboardEvent, PointerEvent, scancode};
 use lan_mouse_proto::ProtoEvent;
 use local_channel::mpsc::{Receiver, Sender, channel};
 use tokio::task::{JoinHandle, spawn_local};
 use tokio_util::sync::CancellationToken;
 
-use crate::connect::LanMouseConnection;
+use crate::{
+    connect::{ConnectionEvent, LanMouseConnection},
+    cursor::CursorHider,
+    game::GameState,
+};
+use lan_mouse_ipc::MacKeys;
+
+/// how often to check whether clients became ready or unreachable
+const READY_CHECK_INTERVAL: Duration = Duration::from_secs(1);
+/// first and longest pause between attempts to reach an unreachable client
+const RECONNECT_DELAY_MIN: Duration = Duration::from_secs(1);
+const RECONNECT_DELAY_MAX: Duration = Duration::from_secs(10);
 
 pub(crate) struct Capture {
     cancellation_token: CancellationToken,
@@ -68,6 +80,8 @@ enum CaptureRequest {
     Reenable,
     /// set release bind
     SetReleaseBind(Vec<scancode::Linux>),
+    /// change how keys are adapted for Macs
+    SetMacKeys(MacKeys),
 }
 
 impl Capture {
@@ -75,12 +89,23 @@ impl Capture {
         backend: Option<input_capture::Backend>,
         conn: LanMouseConnection,
         release_bind: Vec<scancode::Linux>,
+        game: GameState,
+        mac_keys: MacKeys,
+        edge_resistance: u32,
+        cursor: CursorHider,
     ) -> Self {
         let (request_tx, request_rx) = channel();
         let (event_tx, event_rx) = channel();
         let cancellation_token = CancellationToken::new();
         let capture_task = CaptureTask {
             active_client: None,
+            armed: Default::default(),
+            reconnect: Default::default(),
+            game,
+            mac_keys: mac_keys.into(),
+            edge_resistance: edge_resistance as f64,
+            edge_push: None,
+            cursor,
             backend,
             cancellation_token: cancellation_token.clone(),
             captures: Default::default(),
@@ -144,6 +169,10 @@ impl Capture {
     pub(crate) fn set_release_bind(&mut self, bind: Vec<scancode::Linux>) {
         let _ = self.request_tx.send(CaptureRequest::SetReleaseBind(bind));
     }
+
+    pub(crate) fn set_mac_keys(&self, mac_keys: MacKeys) {
+        let _ = self.request_tx.send(CaptureRequest::SetMacKeys(mac_keys));
+    }
 }
 
 /// debounce a statement `$st`, i.e. the statement is executed only if the
@@ -165,6 +194,22 @@ macro_rules! debounce {
 
 struct CaptureTask {
     active_client: Option<CaptureHandle>,
+    /// [`CaptureType::Default`] captures with a barrier in the backend.
+    /// A client is only armed while it is connected and accepts input, so
+    /// an unreachable client never grabs the mouse and a lost connection
+    /// hands it back right away.
+    armed: HashSet<CaptureHandle>,
+    /// next attempt and current back-off for reaching unarmed clients
+    reconnect: HashMap<CaptureHandle, (Instant, Duration)>,
+    /// no client is armed while a game is in the foreground
+    game: GameState,
+    /// adapts keys for clients where exactly one side is a Mac
+    mac_keys: KeyAdapter,
+    /// how far the mouse has to push against an edge to cross over (px)
+    edge_resistance: f64,
+    edge_push: Option<EdgePush>,
+    /// hides the local pointer while the mouse is on another device
+    cursor: CursorHider,
     backend: Option<input_capture::Backend>,
     cancellation_token: CancellationToken,
     captures: Vec<(CaptureHandle, Position, CaptureType)>,
@@ -182,12 +227,105 @@ impl CaptureTask {
 
     fn remove_capture(&mut self, handle: CaptureHandle) {
         self.captures.retain(|&(h, ..)| handle != h);
+        self.reconnect.remove(&handle);
     }
 
     fn is_default_capture_at(&self, pos: Position) -> bool {
         self.captures
             .iter()
-            .any(|&(_, p, t)| p == pos && t == CaptureType::Default)
+            .any(|&(h, p, t)| p == pos && t == CaptureType::Default && self.armed.contains(&h))
+    }
+
+    /// create the barrier for `handle`, now that its client is ready
+    async fn arm(
+        &mut self,
+        capture: &mut InputCapture,
+        handle: CaptureHandle,
+    ) -> Result<(), CaptureError> {
+        if self.armed.insert(handle) {
+            log::info!("client {handle} is ready, capturing at its screen edge");
+            self.reconnect.remove(&handle);
+            capture.create(handle, self.get_pos(handle)).await?;
+        }
+        Ok(())
+    }
+
+    /// adapt an event to the conventions of the device it is sent to
+    fn adapt_event(&self, handle: CaptureHandle, event: Event) -> Event {
+        match event {
+            Event::Keyboard(event) if self.adapts_mac_keys(handle) => {
+                Event::Keyboard(self.mac_keys.event(event))
+            }
+            event => event,
+        }
+    }
+
+    /// keys are adapted when exactly one side is a Mac
+    fn adapts_mac_keys(&self, handle: CaptureHandle) -> bool {
+        self.mac_keys.enabled
+            && self
+                .conn
+                .peer_os(handle)
+                .is_some_and(|peer_os| (peer_os == "macos") != cfg!(target_os = "macos"))
+    }
+
+    /// remove the barrier for `handle`, giving the mouse back if it was there
+    async fn disarm(
+        &mut self,
+        capture: &mut InputCapture,
+        handle: CaptureHandle,
+    ) -> Result<(), CaptureError> {
+        if self.active_client == Some(handle) {
+            self.release_capture(capture).await?;
+        }
+        if self.armed.remove(&handle) {
+            capture.destroy(handle).await?;
+        }
+        Ok(())
+    }
+
+    /// arm clients that became ready, disarm unreachable ones and keep
+    /// trying to reach those, with growing pauses in between.
+    /// While a game is in the foreground, no client is armed.
+    async fn update_armed(&mut self, capture: &mut InputCapture) -> Result<(), CaptureError> {
+        let now = Instant::now();
+        let paused = self.game.active();
+        let defaults = self
+            .captures
+            .iter()
+            .filter(|&&(_, _, t)| t == CaptureType::Default)
+            .map(|&(h, ..)| h)
+            .collect::<Vec<_>>();
+        for handle in defaults {
+            let reachable = self.conn.is_ready(handle).await;
+            let ready = reachable && !paused;
+            let armed = self.armed.contains(&handle);
+            if ready && !armed {
+                self.arm(capture, handle).await?;
+            } else if !ready && armed {
+                if paused {
+                    log::info!(
+                        "game in the foreground, releasing the screen edge of client {handle}"
+                    );
+                } else {
+                    log::info!(
+                        "client {handle} stopped accepting input, releasing its screen edge"
+                    );
+                }
+                self.disarm(capture, handle).await?;
+            } else if !reachable {
+                let (next, delay) = self
+                    .reconnect
+                    .entry(handle)
+                    .or_insert((now, RECONNECT_DELAY_MIN));
+                if now >= *next {
+                    self.conn.connect(handle).await;
+                    *next = now + *delay;
+                    *delay = (*delay * 2).min(RECONNECT_DELAY_MAX);
+                }
+            }
+        }
+        Ok(())
     }
 
     fn get_pos(&self, handle: CaptureHandle) -> Position {
@@ -221,6 +359,7 @@ impl CaptureTask {
                         CaptureRequest::SetReleaseBind(bind) => {
                             self.release_bind.borrow_mut().clone_from(&bind);
                         }
+                        CaptureRequest::SetMacKeys(mac_keys) => self.mac_keys = mac_keys.into(),
                     },
                     _ = self.cancellation_token.cancelled() => return,
                 }
@@ -257,8 +396,13 @@ impl CaptureTask {
     }
 
     async fn create_captures(&mut self, capture: &mut InputCapture) -> Result<(), CaptureError> {
+        // clients get armed by `update_armed` once they are ready
+        self.armed.clear();
         let captures = self.captures.clone();
-        for (handle, pos, _type) in captures {
+        for (handle, pos, capture_type) in captures {
+            if capture_type == CaptureType::Default {
+                continue;
+            }
             tokio::select! {
                 r = capture.create(handle, pos) => r?,
                 _ = self.cancellation_token.cancelled() => return Ok(()),
@@ -271,13 +415,33 @@ impl CaptureTask {
         &mut self,
         capture: &mut InputCapture,
     ) -> Result<(), InputCaptureError> {
+        // the first tick fires right away
+        let mut ready_check = tokio::time::interval(READY_CHECK_INTERVAL);
+        ready_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tokio::select! {
                 event = capture.next() => match event {
                     Some(event) => self.handle_capture_event(capture, event?).await?,
                     None => return Ok(()),
                 },
-                (handle, event) = self.conn.recv() => {
+                _ = ready_check.tick() => self.update_armed(capture).await?,
+                _ = self.game.changed() => self.update_armed(capture).await?,
+                _ = edge_push_idle(&self.edge_push) => {
+                    // stopped pushing against the edge before crossing over
+                    self.edge_push = None;
+                    self.release_capture(capture).await?;
+                }
+                event = self.conn.recv() => {
+                    let (handle, event) = match event {
+                        ConnectionEvent::Event(handle, event) => (handle, event),
+                        ConnectionEvent::Disconnected(handle) => {
+                            if self.armed.contains(&handle) {
+                                log::info!("lost connection to client {handle}, releasing its screen edge");
+                                self.disarm(capture, handle).await?;
+                            }
+                            continue;
+                        }
+                    };
                     if let Some(active) = self.active_client {
                         if handle != active {
                             // we only care about events coming from the client we are currently connected to
@@ -305,7 +469,11 @@ impl CaptureTask {
                     CaptureRequest::Release => self.release_capture(capture).await?,
                     CaptureRequest::Create(h, p, t) => {
                         self.add_capture(h, p, t);
-                        capture.create(h, p).await?;
+                        match t {
+                            // start connecting now, `update_armed` arms it once ready
+                            CaptureType::Default => self.conn.connect(h).await,
+                            CaptureType::EnterOnly => capture.create(h, p).await?,
+                        }
                     }
                     CaptureRequest::Destroy(h) => {
                         // If the capture we're tearing down is the
@@ -318,11 +486,23 @@ impl CaptureTask {
                         if self.active_client == Some(h) {
                             self.release_capture(capture).await?;
                         }
+                        let has_barrier = self.armed.remove(&h)
+                            || self
+                                .captures
+                                .iter()
+                                .any(|&(c, _, t)| c == h && t == CaptureType::EnterOnly);
                         self.remove_capture(h);
-                        capture.destroy(h).await?;
+                        if has_barrier {
+                            capture.destroy(h).await?;
+                        }
                     }
                     CaptureRequest::SetReleaseBind(bind) => {
                         self.release_bind.borrow_mut().clone_from(&bind);
+                    }
+                    CaptureRequest::SetMacKeys(mac_keys) => {
+                        // release first, so keys held down are released with the old mapping
+                        self.release_capture(capture).await?;
+                        self.mac_keys = mac_keys.into();
                     }
                 },
                 _ = self.cancellation_token.cancelled() => break,
@@ -336,7 +516,7 @@ impl CaptureTask {
         capture: &mut InputCapture,
         event: (CaptureHandle, CaptureEvent),
     ) -> Result<(), CaptureError> {
-        let (handle, event) = event;
+        let (handle, mut event) = event;
         log::trace!("({handle}): {event:?}");
 
         if capture.keys_pressed(&self.release_bind.borrow()) {
@@ -362,10 +542,56 @@ impl CaptureTask {
             return Ok(());
         }
 
+        // resist crossing over: only switch to the client once the mouse
+        // kept pushing against the edge, so brushing it does nothing
+        if self.active_client != Some(handle) && self.edge_resistance > 0.0 {
+            match event {
+                CaptureEvent::Begin => {
+                    self.edge_push = Some(EdgePush {
+                        handle,
+                        distance: 0.0,
+                        last_progress: Instant::now(),
+                    });
+                    return Ok(());
+                }
+                CaptureEvent::Input(Event::Pointer(PointerEvent::Motion { dx, dy, .. })) => {
+                    let outward = outward_motion(self.get_pos(handle), dx, dy);
+                    let Some(push) = self.edge_push.as_mut().filter(|push| push.handle == handle)
+                    else {
+                        return self.release_capture(capture).await;
+                    };
+                    push.distance += outward;
+                    if outward > 0.0 {
+                        push.last_progress = Instant::now();
+                    }
+                    if push.distance < -EDGE_PUSH_BACKOFF {
+                        // moved away from the edge
+                        self.edge_push = None;
+                        return self.release_capture(capture).await;
+                    }
+                    if push.distance < self.edge_resistance {
+                        return Ok(());
+                    }
+                    log::debug!(
+                        "pushed {:.0}px against the edge, crossing over",
+                        push.distance
+                    );
+                    self.edge_push = None;
+                    event = CaptureEvent::Begin;
+                }
+                // clicking, scrolling or typing: the user wants to stay here
+                _ => {
+                    self.edge_push = None;
+                    return self.release_capture(capture).await;
+                }
+            }
+        }
+
         // activated a new client
         if event == CaptureEvent::Begin && Some(handle) != self.active_client {
             self.state = State::WaitingForAck;
             self.active_client.replace(handle);
+            self.cursor.hide();
             self.event_tx
                 .send(ICaptureEvent::ClientEntered(handle))
                 .expect("channel closed");
@@ -378,23 +604,27 @@ impl CaptureTask {
             CaptureEvent::Input(e) => match self.state {
                 // connection not acknowledged, repeat `Enter` event
                 State::WaitingForAck => ProtoEvent::Enter(opposite_pos),
-                State::Sending => ProtoEvent::Input(e),
+                State::Sending => ProtoEvent::Input(self.adapt_event(handle, e)),
             },
         };
 
         if let Err(e) = self.conn.send(event, handle).await {
             const DUR: Duration = Duration::from_millis(500);
             debounce!(PREV_LOG, DUR, log::warn!("releasing capture: {e}"));
-            // Funnel through release_capture so the leave_hook
+            // Funnel through release_capture (via disarm) so the leave_hook
             // fires and active_client is cleared (without this the
             // active_client field would stay stale until the next
-            // Begin from a different handle).
-            self.release_capture(capture).await?;
+            // Begin from a different handle). Disarming keeps the
+            // edge from grabbing the mouse again until the client is
+            // ready, instead of re-capturing on every touch.
+            self.disarm(capture, handle).await?;
         }
         Ok(())
     }
 
     async fn release_capture(&mut self, capture: &mut InputCapture) -> Result<(), CaptureError> {
+        self.edge_push = None;
+        self.cursor.show();
         // If we have an active client, notify them we're leaving
         if let Some(handle) = self.active_client.take() {
             // Surface the leave to the service layer so it can fire
@@ -415,11 +645,15 @@ impl CaptureTask {
             // mods until its watchdog times out (1+ s) or our Leave
             // arrives — and Leave can be lost over UDP/DTLS.
             for key in capture.take_pressed_keys() {
-                let key_up = ProtoEvent::Input(Event::Keyboard(KeyboardEvent::Key {
-                    time: 0,
-                    key: key as u32,
-                    state: 0,
-                }));
+                // adapted like the key-down was, so a swapped Ctrl/Cmd can't get stuck
+                let key_up = ProtoEvent::Input(self.adapt_event(
+                    handle,
+                    Event::Keyboard(KeyboardEvent::Key {
+                        time: 0,
+                        key: key as u32,
+                        state: 0,
+                    }),
+                ));
                 if let Err(e) = self.conn.send(key_up, handle).await {
                     log::warn!("failed to send key-up to client {handle}: {e}");
                 }
@@ -459,6 +693,118 @@ enum State {
     Sending,
 }
 
+/// how far the mouse may move back from the edge (px) before a push is cancelled
+const EDGE_PUSH_BACKOFF: f64 = 2.0;
+/// a push is cancelled when the mouse stops pushing against the edge for this long
+const EDGE_PUSH_IDLE: Duration = Duration::from_millis(300);
+
+/// the mouse pushing against a screen edge, not yet far enough to cross over
+struct EdgePush {
+    handle: CaptureHandle,
+    /// how far the mouse was pushed past the edge (px)
+    distance: f64,
+    /// when the mouse last moved outward
+    last_progress: Instant,
+}
+
+/// part of a motion going out through the screen edge at `pos` (px)
+fn outward_motion(pos: Position, dx: f64, dy: f64) -> f64 {
+    match pos {
+        Position::Left => -dx,
+        Position::Right => dx,
+        Position::Top => -dy,
+        Position::Bottom => dy,
+    }
+}
+
+/// resolves once an unfinished push against an edge has been idle for too long
+async fn edge_push_idle(push: &Option<EdgePush>) {
+    match push {
+        Some(push) => tokio::time::sleep_until((push.last_progress + EDGE_PUSH_IDLE).into()).await,
+        None => std::future::pending().await,
+    }
+}
+
+/// XKB modifier masks with the evdev scancode of their left key
+const MODIFIERS: [(u32, u32); 4] = [
+    (scancode::Linux::KeyLeftShift as u32, 1 << 0),
+    (scancode::Linux::KeyLeftCtrl as u32, 1 << 2),
+    (scancode::Linux::KeyLeftAlt as u32, 1 << 3),
+    (scancode::Linux::KeyLeftMeta as u32, 1 << 6),
+];
+
+/// XKB modifier mask of a modifier key
+fn modifier_mask(key: u32) -> Option<u32> {
+    use scancode::Linux::{
+        KeyLeftAlt, KeyLeftCtrl, KeyLeftMeta, KeyLeftShift, KeyRightCtrl, KeyRightShift,
+        KeyRightalt, KeyRightmeta,
+    };
+    match scancode::Linux::try_from(key).ok()? {
+        KeyLeftShift | KeyRightShift => Some(1 << 0),
+        KeyLeftCtrl | KeyRightCtrl => Some(1 << 2),
+        KeyLeftAlt | KeyRightalt => Some(1 << 3),
+        KeyLeftMeta | KeyRightmeta => Some(1 << 6),
+        _ => None,
+    }
+}
+
+/// Adapts keyboard events sent to a device where exactly one side is a Mac,
+/// e.g. swapping Ctrl and Cmd so shortcuts use the key each side is used to.
+struct KeyAdapter {
+    enabled: bool,
+    /// key on this device -> key sent to the other device
+    map: HashMap<u32, u32>,
+}
+
+impl From<MacKeys> for KeyAdapter {
+    fn from(mac_keys: MacKeys) -> Self {
+        Self {
+            enabled: mac_keys.enabled,
+            map: mac_keys.map.into_iter().collect(),
+        }
+    }
+}
+
+impl KeyAdapter {
+    fn event(&self, event: KeyboardEvent) -> KeyboardEvent {
+        match event {
+            KeyboardEvent::Key { time, key, state } => KeyboardEvent::Key {
+                time,
+                key: self.key(key),
+                state,
+            },
+            KeyboardEvent::Modifiers {
+                depressed,
+                latched,
+                locked,
+                group,
+            } => KeyboardEvent::Modifiers {
+                depressed: self.mask(depressed),
+                latched: self.mask(latched),
+                locked: self.mask(locked),
+                group,
+            },
+        }
+    }
+
+    fn key(&self, key: u32) -> u32 {
+        self.map.get(&key).copied().unwrap_or(key)
+    }
+
+    /// move modifier bits along with their remapped keys
+    fn mask(&self, mask: u32) -> u32 {
+        let all = MODIFIERS.iter().fold(0, |all, (_, bit)| all | bit);
+        let mut adapted = mask & !all;
+        for (key, bit) in MODIFIERS {
+            if mask & bit != 0 {
+                // a modifier mapped to a regular key no longer counts as a modifier
+                adapted |= modifier_mask(self.key(key)).unwrap_or(0);
+            }
+        }
+        adapted
+    }
+}
+
 fn to_capture_pos(pos: lan_mouse_ipc::Position) -> input_capture::Position {
     match pos {
         lan_mouse_ipc::Position::Left => input_capture::Position::Left,
@@ -495,5 +841,66 @@ impl<T> Drop for DropGuard<T> {
         self.tx
             .send(self.on_drop.take().expect("item"))
             .expect("channel closed");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use scancode::Linux::{
+        KeyA, KeyCapsLock, KeyLeftAlt, KeyLeftCtrl, KeyLeftMeta, KeyRightCtrl, KeyRightmeta,
+    };
+
+    fn key(key: scancode::Linux, state: u8) -> KeyboardEvent {
+        KeyboardEvent::Key {
+            time: 0,
+            key: key as u32,
+            state,
+        }
+    }
+
+    const SHIFT: u32 = 1 << 0;
+    const CONTROL: u32 = 1 << 2;
+    const ALT: u32 = 1 << 3;
+    const META: u32 = 1 << 6;
+
+    #[test]
+    fn default_swaps_ctrl_and_cmd() {
+        let adapter = KeyAdapter::from(MacKeys::default());
+        assert_eq!(adapter.event(key(KeyLeftCtrl, 1)), key(KeyLeftMeta, 1));
+        assert_eq!(adapter.event(key(KeyLeftMeta, 0)), key(KeyLeftCtrl, 0));
+        assert_eq!(adapter.event(key(KeyRightCtrl, 1)), key(KeyRightmeta, 1));
+        assert_eq!(adapter.event(key(KeyRightmeta, 1)), key(KeyRightCtrl, 1));
+        assert_eq!(adapter.event(key(KeyA, 1)), key(KeyA, 1));
+
+        assert_eq!(adapter.mask(CONTROL), META);
+        assert_eq!(adapter.mask(META | SHIFT), CONTROL | SHIFT);
+        assert_eq!(adapter.mask(CONTROL | META), CONTROL | META);
+        assert_eq!(adapter.mask(SHIFT), SHIFT);
+    }
+
+    #[test]
+    fn custom_mapping() {
+        // Alt becomes Cmd, Caps Lock becomes Ctrl, everything else stays
+        let adapter = KeyAdapter::from(MacKeys {
+            enabled: true,
+            map: vec![
+                (KeyLeftAlt as u32, KeyLeftMeta as u32),
+                (KeyCapsLock as u32, KeyLeftCtrl as u32),
+            ],
+        });
+        assert_eq!(adapter.event(key(KeyLeftAlt, 1)), key(KeyLeftMeta, 1));
+        assert_eq!(adapter.event(key(KeyCapsLock, 1)), key(KeyLeftCtrl, 1));
+        assert_eq!(adapter.event(key(KeyLeftCtrl, 1)), key(KeyLeftCtrl, 1));
+        assert_eq!(adapter.mask(ALT | CONTROL), META | CONTROL);
+    }
+
+    #[test]
+    fn edge_push_direction() {
+        assert_eq!(outward_motion(Position::Left, -5.0, 1.0), 5.0);
+        assert_eq!(outward_motion(Position::Left, 3.0, 0.0), -3.0);
+        assert_eq!(outward_motion(Position::Right, 4.0, 9.0), 4.0);
+        assert_eq!(outward_motion(Position::Top, 9.0, -2.0), 2.0);
+        assert_eq!(outward_motion(Position::Bottom, 0.0, 6.0), 6.0);
     }
 }

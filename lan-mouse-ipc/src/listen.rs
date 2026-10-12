@@ -71,7 +71,7 @@ impl AsyncFrontendListener {
         };
 
         #[cfg(windows)]
-        let listener = match TcpListener::bind("127.0.0.1:5252").await {
+        let listener = match TcpListener::bind(crate::ipc_addr()).await {
             Ok(ls) => ls,
             // some other lan-mouse instance has bound the socket in the meantime
             Err(e) if e.kind() == ErrorKind::AddrInUse => {

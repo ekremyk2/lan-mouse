@@ -1,4 +1,6 @@
 use crate::config::local_commit;
+use crate::cursor::CursorHider;
+use crate::game::GameState;
 use crate::listen::{LanMouseListener, ListenEvent, ListenerCreationError};
 use futures::StreamExt;
 use input_emulation::{EmulationHandle, InputEmulation, InputEmulationError};
@@ -77,6 +79,8 @@ impl Emulation {
     pub(crate) fn new(
         backend: Option<input_emulation::Backend>,
         listener: LanMouseListener,
+        game: GameState,
+        cursor: CursorHider,
     ) -> Self {
         let emulation_proxy = EmulationProxy::new(backend);
         let (request_tx, request_rx) = channel();
@@ -86,6 +90,8 @@ impl Emulation {
             emulation_proxy,
             request_rx,
             event_tx,
+            game,
+            cursor,
         };
         let task = spawn_local(emulation_task.run());
         Self {
@@ -134,6 +140,10 @@ struct ListenTask {
     emulation_proxy: EmulationProxy,
     request_rx: Receiver<EmulationRequest>,
     event_tx: Sender<EmulationEvent>,
+    /// other devices may not move their mouse into a game in the foreground
+    game: GameState,
+    /// hides the pointer once another device stops controlling this one
+    cursor: CursorHider,
 }
 
 impl ListenTask {
@@ -148,7 +158,14 @@ impl ListenTask {
                         log::trace!("{event} <-<-<-<-<- {addr}");
                         last_response.insert(addr, Instant::now());
                         match event {
+                            // a game is in the foreground: send the other device's mouse right back
+                            ProtoEvent::Enter(_) if self.game.active() => {
+                                log::debug!("not letting {addr} in: a game is in the foreground");
+                                self.listener.reply(addr, ProtoEvent::Leave(0)).await;
+                            }
+                            ProtoEvent::Input(_) if self.game.active() => {}
                             ProtoEvent::Enter(pos) => {
+                                self.cursor.show();
                                 if let Some(fingerprint) = self.listener.get_certificate_fingerprint(addr).await {
                                     log::info!("releasing capture: {addr} entered this device");
                                     self.event_tx.send(EmulationEvent::ReleaseNotify).expect("channel closed");
@@ -157,11 +174,18 @@ impl ListenTask {
                                 }
                             }
                             ProtoEvent::Leave(_) => {
+                                // the user went back to the other device
+                                self.cursor.hide();
                                 self.emulation_proxy.remove(addr);
                                 self.listener.reply(addr, ProtoEvent::Ack(0)).await;
                             }
                             ProtoEvent::Input(event) => self.emulation_proxy.consume(event, addr),
-                            ProtoEvent::Ping => self.listener.reply(addr, ProtoEvent::Pong(self.emulation_proxy.emulation_active.get())).await,
+                            // not accepting input while a game is in the foreground,
+                            // so the other device stops capturing at its screen edge
+                            ProtoEvent::Ping => {
+                                let accepting = self.emulation_proxy.emulation_active.get() && !self.game.active();
+                                self.listener.reply(addr, ProtoEvent::Pong(accepting)).await;
+                            }
                             // Peer's version handshake. Echo our own
                             // commit back so the peer's connect-side
                             // receive_loop populates its `peer_commit`,
@@ -193,6 +217,15 @@ impl ListenTask {
                 }}
                 event = self.emulation_proxy.event() => {
                     self.event_tx.send(event).expect("channel closed");
+                }
+                _ = self.game.changed() => {
+                    // a game came to the foreground: hand every other device's mouse back
+                    if self.game.active() {
+                        for &addr in last_response.keys() {
+                            self.emulation_proxy.remove(addr);
+                            self.listener.reply(addr, ProtoEvent::Leave(0)).await;
+                        }
+                    }
                 }
                 request = self.request_rx.recv() => match request.expect("channel closed") {
                     // reenable emulation

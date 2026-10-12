@@ -1,12 +1,15 @@
 use crate::{
     capture::{Capture, CaptureType, ICaptureEvent},
     client::ClientManager,
+    clipboard::ClipboardSync,
     config::{Config, ConfigClient},
     connect::LanMouseConnection,
     crypto,
+    cursor::CursorHider,
     discovery::{self, Discovery, DiscoveryEvent},
     dns::{DnsEvent, DnsResolver},
     emulation::{Emulation, EmulationEvent},
+    game::GameWatch,
     listen::{LanMouseListener, ListenerCreationError},
 };
 use futures::StreamExt;
@@ -49,6 +52,10 @@ pub struct Service {
     discovery: Option<Discovery>,
     /// devices currently visible on the local network, by id
     discovered: HashMap<String, DiscoveredDevice>,
+    /// whether a game is in the foreground
+    game_watch: GameWatch,
+    /// clipboard sharing (None if unavailable)
+    clipboard: Option<ClipboardSync>,
     /// frontend listener
     frontend_listener: AsyncFrontendListener,
     /// authorized public key sha256 fingerprints
@@ -101,16 +108,45 @@ impl Service {
             LanMouseListener::new(config.port(), cert.clone(), authorized_keys.clone()).await?;
         let conn = LanMouseConnection::new(cert.clone(), client_manager.clone());
 
+        // pause sharing while a game is in the foreground
+        let game_watch = GameWatch::new(config.pause_for_games(), config.game_programs());
+
+        // only the device in use shows a mouse pointer
+        let cursor = CursorHider::new(config.hide_cursor());
+
         // input capture + emulation
         let capture_backend = config.capture_backend().map(|b| b.into());
-        let capture = Capture::new(capture_backend, conn, config.release_bind());
+        let capture = Capture::new(
+            capture_backend,
+            conn,
+            config.release_bind(),
+            game_watch.subscribe(),
+            config.mac_keys(),
+            config.edge_resistance(),
+            cursor.clone(),
+        );
         let emulation_backend = config.emulation_backend().map(|b| b.into());
-        let emulation = Emulation::new(emulation_backend, listener);
+        let emulation = Emulation::new(emulation_backend, listener, game_watch.subscribe(), cursor);
 
         // create dns resolver
         let resolver = DnsResolver::new()?;
 
         let port = config.port();
+
+        // share the clipboard with connected devices
+        let clipboard = match ClipboardSync::new(
+            config.clipboard(),
+            port,
+            &cert,
+            authorized_keys.clone(),
+            client_manager.clone(),
+        ) {
+            Ok(clipboard) => Some(clipboard),
+            Err(e) => {
+                log::warn!("clipboard sharing unavailable: {e}");
+                None
+            }
+        };
 
         // advertise this device and look for others on the local network
         let discovery = if config.discovery() {
@@ -134,6 +170,8 @@ impl Service {
             resolver,
             discovery,
             discovered: Default::default(),
+            game_watch,
+            clipboard,
             authorized_keys,
             public_key_fingerprint,
             client_manager,
@@ -185,6 +223,10 @@ impl Service {
         if let Some(discovery) = &mut self.discovery {
             log::debug!("terminating discovery ...");
             discovery.terminate().await;
+        }
+        self.game_watch.terminate();
+        if let Some(clipboard) = &mut self.clipboard {
+            clipboard.terminate();
         }
 
         Ok(())
@@ -251,6 +293,20 @@ impl Service {
                 self.save_config();
             }
             FrontendRequest::Ping(token) => self.notify_frontend(FrontendEvent::Pong(token)),
+            FrontendRequest::SetClipboardSharing(enabled) => {
+                if let Some(clipboard) = &self.clipboard {
+                    clipboard.set_enabled(enabled);
+                }
+                self.config.set_clipboard(enabled);
+                self.save_config();
+                self.notify_frontend(FrontendEvent::ClipboardSharing(enabled));
+            }
+            FrontendRequest::SetMacKeys(mac_keys) => {
+                self.capture.set_mac_keys(mac_keys.clone());
+                self.config.set_mac_keys(&mac_keys);
+                self.save_config();
+                self.notify_frontend(FrontendEvent::MacKeys(mac_keys));
+            }
         }
     }
 
@@ -293,6 +349,10 @@ impl Service {
         }
         let release_bind = self.config.release_bind();
         self.capture.set_release_bind(release_bind);
+        self.capture.set_mac_keys(self.config.mac_keys());
+        if let Some(clipboard) = &self.clipboard {
+            clipboard.set_enabled(self.config.clipboard());
+        }
         let authorized_keys = self.config.authorized_fingerprints();
         self.authorized_keys
             .write()
@@ -412,6 +472,7 @@ impl Service {
                 }
                 let ips = ips.unwrap_or_default();
                 self.client_manager.set_dns_ips(handle, ips);
+                self.update_discovered_ips(handle);
                 handle
             }
         };
@@ -452,28 +513,45 @@ impl Service {
         self.notify_discovered();
     }
 
-    /// use the addresses a client's device announces via mDNS
+    /// use what a client's device announces about itself: its addresses
+    /// and operating system. A device belongs to a client if it has the
+    /// client's hostname or one of its configured or resolved addresses.
     fn update_discovered_ips(&mut self, handle: ClientHandle) {
-        let Some(hostname) = self.client_manager.get_hostname(handle) else {
-            return;
-        };
-        let mut ips = self
+        let devices = self
             .discovered
             .values()
-            .filter(|device| discovery::matches_hostname(device, &hostname))
-            .flat_map(|device| device.ips.iter().copied())
+            .filter(|device| self.is_client_device(handle, device))
             .collect::<Vec<_>>();
-        // keep the last known addresses when a device disappears: mDNS
-        // records can expire on flaky Wi-Fi while the device is still
-        // reachable, and connecting tries all addresses in parallel anyway
-        if ips.is_empty() {
+        // keep the last known state when a device disappears: announcements
+        // can get lost on flaky Wi-Fi while the device is still reachable,
+        // and connecting tries all addresses in parallel anyway
+        if devices.is_empty() {
             return;
         }
+        let mut ips = devices
+            .iter()
+            .flat_map(|device| device.ips.iter().copied())
+            .collect::<Vec<_>>();
         ips.sort();
         ips.dedup();
-        if self.client_manager.set_discovered_ips(handle, ips) {
+        let peer_os = devices.iter().find_map(|device| device.os.clone());
+        let ips_changed = self.client_manager.set_discovered_ips(handle, ips);
+        let os_changed = self.client_manager.set_peer_os(handle, peer_os);
+        if ips_changed || os_changed {
             self.broadcast_client(handle);
         }
+    }
+
+    /// whether `device` belongs to client `handle`
+    fn is_client_device(&self, handle: ClientHandle, device: &DiscoveredDevice) -> bool {
+        self.client_manager
+            .get_hostname(handle)
+            .is_some_and(|hostname| discovery::matches_hostname(device, &hostname))
+            || self
+                .client_manager
+                .known_ips(handle)
+                .iter()
+                .any(|ip| device.ips.contains(ip))
     }
 
     fn notify_discovered(&mut self) {
@@ -495,11 +573,7 @@ impl Service {
             .client_manager
             .registered_clients()
             .into_iter()
-            .find(|&h| {
-                self.client_manager
-                    .get_hostname(h)
-                    .is_some_and(|hostname| discovery::matches_hostname(&device, &hostname))
-            });
+            .find(|&h| self.is_client_device(h, &device));
         let handle = match existing {
             Some(handle) => {
                 log::info!("client {handle} already refers to {}", device.name);
@@ -534,6 +608,8 @@ impl Service {
         let keys = self.authorized_keys.read().expect("lock").clone();
         self.notify_frontend(FrontendEvent::AuthorizedUpdated(keys));
         self.notify_discovered();
+        self.notify_frontend(FrontendEvent::MacKeys(self.config.mac_keys()));
+        self.notify_frontend(FrontendEvent::ClipboardSharing(self.config.clipboard()));
     }
 
     const ENTER_HANDLE_BEGIN: u64 = u64::MAX / 2 + 1;
@@ -688,6 +764,7 @@ impl Service {
 
     fn update_fix_ips(&mut self, handle: ClientHandle, fix_ips: Vec<IpAddr>) {
         self.client_manager.set_fix_ips(handle, fix_ips);
+        self.update_discovered_ips(handle);
         self.broadcast_client(handle);
     }
 

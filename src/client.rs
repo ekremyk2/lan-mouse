@@ -190,6 +190,36 @@ impl ClientManager {
         changed
     }
 
+    /// update the operating system announced by the client
+    /// returns true, if it changed
+    pub fn set_peer_os(&self, handle: ClientHandle, peer_os: Option<String>) -> bool {
+        match self.clients.borrow_mut().get_mut(handle as usize) {
+            Some((_, s)) if s.peer_os != peer_os => {
+                s.peer_os = peer_os;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// operating system announced by the client, if known
+    pub(crate) fn peer_os(&self, handle: ClientHandle) -> Option<String> {
+        self.clients
+            .borrow()
+            .get(handle as usize)
+            .and_then(|(_, s)| s.peer_os.clone())
+    }
+
+    /// ips configured for or resolved from the client's hostname,
+    /// i.e. not including those learned from discovery
+    pub(crate) fn known_ips(&self, handle: ClientHandle) -> Vec<IpAddr> {
+        self.clients
+            .borrow()
+            .get(handle as usize)
+            .map(|(c, s)| c.fix_ips.iter().chain(&s.dns_ips).copied().collect())
+            .unwrap_or_default()
+    }
+
     fn update_ips(&self, handle: ClientHandle) {
         if let Some((c, s)) = self.clients.borrow_mut().get_mut(handle as usize) {
             s.ips = c

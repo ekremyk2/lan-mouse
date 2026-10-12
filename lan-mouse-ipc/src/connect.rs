@@ -53,7 +53,7 @@ pub fn try_connect() -> Result<(FrontendEventReader, FrontendRequestWriter), Con
         UnixStream::connect(&socket_path)?
     };
     #[cfg(windows)]
-    let rx = TcpStream::connect("127.0.0.1:5252")?;
+    let rx = TcpStream::connect(crate::ipc_addr())?;
     make_connection(rx)
 }
 
@@ -107,7 +107,7 @@ fn wait_for_service() -> Result<UnixStream, ConnectionError> {
 fn wait_for_service() -> Result<TcpStream, ConnectionError> {
     let mut duration = Duration::from_millis(10);
     loop {
-        if let Ok(stream) = TcpStream::connect("127.0.0.1:5252") {
+        if let Ok(stream) = TcpStream::connect(crate::ipc_addr()) {
             break Ok(stream);
         }
         thread::sleep(exponential_back_off(&mut duration));

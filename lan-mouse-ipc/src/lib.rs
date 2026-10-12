@@ -171,8 +171,10 @@ pub struct ClientState {
     pub alive: bool,
     /// ips from dns
     pub dns_ips: Vec<IpAddr>,
-    /// ips announced by the client itself via mDNS discovery
+    /// ips announced by the client itself via discovery
     pub discovered_ips: Vec<IpAddr>,
+    /// operating system of the client as announced via discovery, e.g. `macos`
+    pub peer_os: Option<String>,
     /// all ip addresses associated with a particular client
     /// e.g. Laptops usually have at least an ethernet and a wifi port
     /// which have different ip addresses
@@ -187,6 +189,60 @@ pub struct ClientState {
     /// that predates the Hello event. The frontend uses this to
     /// soft-warn on version mismatch.
     pub peer_commit: Option<[u8; 8]>,
+}
+
+/// How keys are adapted when exactly one of two devices is a Mac, so
+/// shortcuts like copy & paste use the key each side is used to.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MacKeys {
+    /// whether keys are adapted at all
+    pub enabled: bool,
+    /// (key on this device, key sent to the other device) as evdev scancodes
+    pub map: Vec<(u32, u32)>,
+}
+
+/// Ctrl and Win / Cmd swapped
+pub const DEFAULT_MAC_KEY_MAP: [(u32, u32); 4] = [(29, 125), (125, 29), (97, 126), (126, 97)];
+
+impl Default for MacKeys {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            map: DEFAULT_MAC_KEY_MAP.to_vec(),
+        }
+    }
+}
+
+/// keys that can be remapped, as (evdev scancode, name)
+pub const MAPPABLE_KEYS: &[(u32, &str)] = &[
+    (29, "Left Ctrl"),
+    (97, "Right Ctrl"),
+    (125, "Left Win / Cmd"),
+    (126, "Right Win / Cmd"),
+    (56, "Left Alt / Option"),
+    (100, "Right Alt / Option"),
+    (42, "Left Shift"),
+    (54, "Right Shift"),
+    (58, "Caps Lock"),
+    (127, "Menu"),
+    (1, "Esc"),
+    (15, "Tab"),
+    (110, "Insert"),
+    (111, "Delete"),
+    (102, "Home"),
+    (107, "End"),
+    (104, "Page Up"),
+    (109, "Page Down"),
+    (99, "Print Screen"),
+];
+
+/// readable name of an evdev scancode
+pub fn key_name(key: u32) -> String {
+    MAPPABLE_KEYS
+        .iter()
+        .find(|(k, _)| *k == key)
+        .map(|(_, name)| (*name).to_owned())
+        .unwrap_or_else(|| format!("key {key}"))
 }
 
 /// a Lan Mouse device found on the local network via mDNS
@@ -251,6 +307,10 @@ pub enum FrontendEvent {
     Discovered(Vec<DiscoveredDevice>),
     /// answer to [`FrontendRequest::Ping`] with the same token
     Pong(u64),
+    /// how keys are adapted for Macs
+    MacKeys(MacKeys),
+    /// whether the clipboard is shared with connected devices
+    ClipboardSharing(bool),
 }
 
 #[derive(Debug, Eq, PartialEq, Clone, Serialize, Deserialize)]
@@ -297,6 +357,10 @@ pub enum FrontendRequest {
     AddDiscovered(String, Position),
     /// answered with [`FrontendEvent::Pong`] once all previous requests are handled
     Ping(u64),
+    /// change how keys are adapted for Macs
+    SetMacKeys(MacKeys),
+    /// turn clipboard sharing on or off
+    SetClipboardSharing(bool),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
@@ -354,5 +418,16 @@ pub fn is_service_running() -> bool {
 /// Check if a lan-mouse service is already running by probing the IPC socket.
 #[cfg(windows)]
 pub fn is_service_running() -> bool {
-    std::net::TcpStream::connect("127.0.0.1:5252").is_ok()
+    std::net::TcpStream::connect(ipc_addr()).is_ok()
+}
+
+/// Address of the service's IPC socket on Windows. The port can be changed
+/// with `LAN_MOUSE_IPC_PORT`, e.g. to run a second instance for testing.
+#[cfg(windows)]
+pub(crate) fn ipc_addr() -> String {
+    let port = std::env::var("LAN_MOUSE_IPC_PORT")
+        .ok()
+        .and_then(|port| port.parse::<u16>().ok())
+        .unwrap_or(5252);
+    format!("127.0.0.1:{port}")
 }

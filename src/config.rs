@@ -17,7 +17,7 @@ use toml;
 use toml_edit::{self, DocumentMut};
 
 use lan_mouse_cli::CliArgs;
-use lan_mouse_ipc::{DEFAULT_PORT, Position};
+use lan_mouse_ipc::{DEFAULT_PORT, MacKeys, Position};
 
 use input_event::scancode::{
     self,
@@ -70,6 +70,13 @@ struct ConfigToml {
     clients: Option<Vec<TomlClient>>,
     authorized_fingerprints: Option<HashMap<String, String>>,
     discovery: Option<bool>,
+    pause_for_games: Option<bool>,
+    game_programs: Option<Vec<String>>,
+    edge_resistance: Option<u32>,
+    mac_keys: Option<bool>,
+    mac_key_map: Option<Vec<(scancode::Linux, scancode::Linux)>>,
+    clipboard: Option<bool>,
+    hide_cursor: Option<bool>,
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug, Eq, PartialEq)]
@@ -345,6 +352,8 @@ pub enum ConfigError {
 const DEFAULT_RELEASE_KEYS: [scancode::Linux; 4] =
     [KeyLeftCtrl, KeyLeftShift, KeyLeftMeta, KeyLeftAlt];
 
+const DEFAULT_EDGE_RESISTANCE: u32 = 150;
+
 impl Config {
     pub fn new() -> Result<Self, ConfigError> {
         let args = Args::parse();
@@ -487,6 +496,89 @@ impl Config {
             .as_ref()
             .and_then(|c| c.discovery)
             .unwrap_or(true)
+    }
+
+    /// whether to pause mouse sharing while a game is in the foreground
+    pub fn pause_for_games(&self) -> bool {
+        self.config_toml
+            .as_ref()
+            .and_then(|c| c.pause_for_games)
+            .unwrap_or(true)
+    }
+
+    /// executable names to treat as games, in addition to the detected ones
+    pub fn game_programs(&self) -> Vec<String> {
+        self.config_toml
+            .as_ref()
+            .and_then(|c| c.game_programs.clone())
+            .unwrap_or_default()
+    }
+
+    /// whether to hide the mouse pointer on the device that is not in use
+    pub fn hide_cursor(&self) -> bool {
+        self.config_toml
+            .as_ref()
+            .and_then(|c| c.hide_cursor)
+            .unwrap_or(true)
+    }
+
+    /// whether to share the clipboard with connected devices
+    pub fn clipboard(&self) -> bool {
+        self.config_toml
+            .as_ref()
+            .and_then(|c| c.clipboard)
+            .unwrap_or(true)
+    }
+
+    pub fn set_clipboard(&mut self, enabled: bool) {
+        self.config_toml
+            .get_or_insert_with(Default::default)
+            .clipboard = Some(enabled);
+    }
+
+    /// how far the mouse has to push against a screen edge to cross over (px)
+    pub fn edge_resistance(&self) -> u32 {
+        self.config_toml
+            .as_ref()
+            .and_then(|c| c.edge_resistance)
+            .unwrap_or(DEFAULT_EDGE_RESISTANCE)
+    }
+
+    /// how keys are adapted when exactly one side is a Mac
+    pub fn mac_keys(&self) -> MacKeys {
+        let default = MacKeys::default();
+        let Some(config) = self.config_toml.as_ref() else {
+            return default;
+        };
+        MacKeys {
+            enabled: config.mac_keys.unwrap_or(default.enabled),
+            map: config
+                .mac_key_map
+                .as_ref()
+                .map(|map| {
+                    map.iter()
+                        .map(|&(from, to)| (from as u32, to as u32))
+                        .collect()
+                })
+                .unwrap_or(default.map),
+        }
+    }
+
+    pub fn set_mac_keys(&mut self, mac_keys: &MacKeys) {
+        let config = self.config_toml.get_or_insert_with(Default::default);
+        config.mac_keys = Some(mac_keys.enabled);
+        config.mac_key_map = Some(
+            mac_keys
+                .map
+                .iter()
+                .filter_map(|&(from, to)| {
+                    Some((
+                        scancode::Linux::try_from(from).ok()?,
+                        scancode::Linux::try_from(to).ok()?,
+                    ))
+                })
+                .collect(),
+        );
     }
 
     /// list of configured clients

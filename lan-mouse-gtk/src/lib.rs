@@ -327,6 +327,10 @@ fn build_ui(app: &Application) {
                     // nearby devices are not shown in the GUI yet
                     FrontendEvent::Discovered(_) => {}
                     FrontendEvent::Pong(_) => {}
+                    FrontendEvent::MacKeys(mac_keys) => window.set_mac_keys(mac_keys),
+                    FrontendEvent::ClipboardSharing(enabled) => {
+                        window.set_clipboard_sharing(enabled)
+                    }
                 }
             }
         }

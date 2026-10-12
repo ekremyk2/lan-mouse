@@ -1,6 +1,6 @@
 mod imp;
 
-use std::collections::HashMap;
+use std::{cell::RefCell, collections::HashMap};
 
 use adw::prelude::*;
 use adw::subclass::prelude::*;
@@ -12,7 +12,7 @@ use gtk::{
 
 use lan_mouse_ipc::{
     ClientConfig, ClientHandle, ClientState, DEFAULT_PORT, FrontendRequest, FrontendRequestWriter,
-    Position,
+    MAPPABLE_KEYS, MacKeys, Position, key_name,
 };
 
 use crate::{
@@ -246,6 +246,142 @@ impl Window {
 
     fn setup_icon(&self) {
         self.set_icon_name(Some("de.feschber.LanMouse"));
+    }
+
+    fn setup_mac_keys(&self) {
+        let names = MAPPABLE_KEYS
+            .iter()
+            .map(|(_, name)| *name)
+            .collect::<Vec<_>>();
+        let from = gtk::DropDown::from_strings(&names);
+        let to = gtk::DropDown::from_strings(&names);
+        // default suggestion: Left Ctrl -> Left Win / Cmd
+        to.set_selected(2);
+        for dropdown in [&from, &to] {
+            dropdown.set_valign(gtk::Align::Center);
+        }
+        let arrow = gtk::Image::from_icon_name("go-next-symbolic");
+        let add = gtk::Button::from_icon_name("list-add-symbolic");
+        add.set_valign(gtk::Align::Center);
+        add.set_tooltip_text(Some("add mapping"));
+        add.connect_clicked(clone!(
+            #[weak(rename_to = window)]
+            self,
+            move |_| window.add_mac_key_mapping()
+        ));
+        let row = &self.imp().mac_key_add_row;
+        row.add_suffix(&from);
+        row.add_suffix(&arrow);
+        row.add_suffix(&to);
+        row.add_suffix(&add);
+        self.imp().mac_key_from.replace(Some(from));
+        self.imp().mac_key_to.replace(Some(to));
+
+        self.imp().mac_keys_switch.connect_active_notify(clone!(
+            #[weak(rename_to = window)]
+            self,
+            move |switch| {
+                if window.imp().updating_mac_keys.get() {
+                    return;
+                }
+                let mut mac_keys = window.imp().mac_keys.borrow().clone();
+                mac_keys.enabled = switch.is_active();
+                window.request_mac_keys(mac_keys);
+            }
+        ));
+        self.set_mac_keys(MacKeys::default());
+    }
+
+    /// show the key mapping reported by the service
+    pub(super) fn set_mac_keys(&self, mac_keys: MacKeys) {
+        let imp = self.imp();
+        imp.updating_mac_keys.set(true);
+        imp.mac_keys_switch.set_active(mac_keys.enabled);
+        imp.updating_mac_keys.set(false);
+
+        let list = &imp.mac_key_list;
+        while let Some(row) = list.row_at_index(0) {
+            list.remove(&row);
+        }
+        for &(from, to) in &mac_keys.map {
+            let row = adw::ActionRow::builder()
+                .title(format!("{}  →  {}", key_name(from), key_name(to)))
+                .build();
+            let delete = gtk::Button::from_icon_name("user-trash-symbolic");
+            delete.set_valign(gtk::Align::Center);
+            delete.set_tooltip_text(Some("remove mapping"));
+            delete.add_css_class("flat");
+            delete.connect_clicked(clone!(
+                #[weak(rename_to = window)]
+                self,
+                move |_| {
+                    let mut mac_keys = window.imp().mac_keys.borrow().clone();
+                    mac_keys.map.retain(|&(key, _)| key != from);
+                    window.request_mac_keys(mac_keys);
+                }
+            ));
+            row.add_suffix(&delete);
+            list.append(&row);
+        }
+        let placeholder = imp.mac_key_placeholder.get();
+        list.set_placeholder(mac_keys.map.is_empty().then_some(&placeholder));
+        // greyed out while switched off
+        list.set_sensitive(mac_keys.enabled);
+        imp.mac_key_add_row.set_sensitive(mac_keys.enabled);
+        imp.mac_keys.replace(mac_keys);
+    }
+
+    fn add_mac_key_mapping(&self) {
+        let selected = |dropdown: &RefCell<Option<gtk::DropDown>>| {
+            let index = dropdown
+                .borrow()
+                .as_ref()
+                .map(|d| d.selected())
+                .unwrap_or(0);
+            MAPPABLE_KEYS.get(index as usize).map(|(key, _)| *key)
+        };
+        let (Some(from), Some(to)) = (
+            selected(&self.imp().mac_key_from),
+            selected(&self.imp().mac_key_to),
+        ) else {
+            return;
+        };
+        if from == to {
+            self.show_toast("pick two different keys");
+            return;
+        }
+        let mut mac_keys = self.imp().mac_keys.borrow().clone();
+        // a key can only be mapped once
+        mac_keys.map.retain(|&(key, _)| key != from);
+        mac_keys.map.push((from, to));
+        self.request_mac_keys(mac_keys);
+    }
+
+    fn setup_clipboard(&self) {
+        self.imp().clipboard_switch.connect_active_notify(clone!(
+            #[weak(rename_to = window)]
+            self,
+            move |switch| {
+                if !window.imp().updating_clipboard.get() {
+                    window.request(FrontendRequest::SetClipboardSharing(switch.is_active()));
+                }
+            }
+        ));
+    }
+
+    pub(super) fn set_clipboard_sharing(&self, enabled: bool) {
+        let imp = self.imp();
+        imp.updating_clipboard.set(true);
+        imp.clipboard_switch.set_active(enabled);
+        imp.updating_clipboard.set(false);
+    }
+
+    fn request_mac_keys(&self, mac_keys: MacKeys) {
+        self.request(FrontendRequest::SetMacKeys(mac_keys));
+    }
+
+    fn request_mac_keys_reset(&self) {
+        self.request_mac_keys(MacKeys::default());
     }
 
     /// workaround for a bug in libadwaita that shows an ugly line beneath

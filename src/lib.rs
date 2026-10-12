@@ -1,12 +1,15 @@
 mod capture;
 pub mod capture_test;
 pub mod client;
+mod clipboard;
 pub mod config;
 mod connect;
 mod crypto;
+mod cursor;
 mod discovery;
 mod dns;
 mod emulation;
 pub mod emulation_test;
+mod game;
 mod listen;
 pub mod service;

@@ -4,9 +4,11 @@ use adw::subclass::prelude::*;
 use adw::{ActionRow, PreferencesGroup, ToastOverlay, prelude::*};
 use glib::subclass::InitializingObject;
 use gtk::glib::clone;
-use gtk::{Button, CompositeTemplate, Entry, Image, Label, ListBox, gdk, gio, glib};
+use gtk::{
+    Button, CompositeTemplate, DropDown, Entry, Image, Label, ListBox, Switch, gdk, gio, glib,
+};
 
-use lan_mouse_ipc::{DEFAULT_PORT, FrontendRequestWriter};
+use lan_mouse_ipc::{DEFAULT_PORT, FrontendRequestWriter, MacKeys};
 
 use crate::authorization_window::AuthorizationWindow;
 
@@ -45,6 +47,26 @@ pub struct Window {
     pub input_capture_button: TemplateChild<Button>,
     #[template_child]
     pub authorized_list: TemplateChild<ListBox>,
+    #[template_child]
+    pub clipboard_switch: TemplateChild<Switch>,
+    /// set while the switch is updated from the service, so that doesn't
+    /// count as the user flipping it
+    pub updating_clipboard: Cell<bool>,
+    #[template_child]
+    pub mac_keys_switch: TemplateChild<Switch>,
+    #[template_child]
+    pub mac_key_add_row: TemplateChild<ActionRow>,
+    #[template_child]
+    pub mac_key_list: TemplateChild<ListBox>,
+    #[template_child]
+    pub mac_key_placeholder: TemplateChild<ActionRow>,
+    /// key mapping as last reported by the service
+    pub mac_keys: RefCell<MacKeys>,
+    /// set while the widgets are updated from `mac_keys`, so that
+    /// doesn't count as the user changing them
+    pub updating_mac_keys: Cell<bool>,
+    pub mac_key_from: RefCell<Option<DropDown>>,
+    pub mac_key_to: RefCell<Option<DropDown>>,
     pub clients: RefCell<Option<gio::ListStore>>,
     pub authorized: RefCell<Option<gio::ListStore>>,
     pub frontend_request_writer: RefCell<Option<FrontendRequestWriter>>,
@@ -176,6 +198,11 @@ impl Window {
         self.obj().open_fingerprint_dialog(None);
     }
 
+    #[template_callback]
+    fn handle_mac_keys_reset(&self) {
+        self.obj().request_mac_keys_reset();
+    }
+
     pub fn set_port(&self, port: u16) {
         self.port.set(port);
         if port == DEFAULT_PORT {
@@ -200,6 +227,8 @@ impl ObjectImpl for Window {
         obj.setup_icon();
         obj.setup_clients();
         obj.setup_authorized();
+        obj.setup_mac_keys();
+        obj.setup_clipboard();
     }
 }
 

@@ -184,6 +184,19 @@
                           </object>
                         </child>
                         <child>
+                          <object class="AdwActionRow">
+                            <property name="title" translatable="yes">Share clipboard</property>
+                            <property name="subtitle" translatable="yes">copy on one device, paste on the other</property>
+                            <property name="icon-name">edit-paste-symbolic</property>
+                            <property name="activatable-widget">clipboard_switch</property>
+                            <child>
+                              <object class="GtkSwitch" id="clipboard_switch">
+                                <property name="valign">center</property>
+                              </object>
+                            </child>
+                          </object>
+                        </child>
+                        <child>
                           <object class="AdwActionRow" id="fingerprint_row">
                             <property name="title">certificate fingerprint</property>
                             <property name="icon-name">auth-fingerprint-symbolic</property>
@@ -194,6 +207,64 @@
                                 <signal name="clicked" handler="handle_copy_fingerprint" swapped="true"/>
                               </object>
                             </child>
+                          </object>
+                        </child>
+                      </object>
+                    </child>
+                    <child>
+                      <object class="AdwPreferencesGroup">
+                        <property name="title" translatable="yes">Mac Keyboard</property>
+                        <property name="description" translatable="yes">Adapt keys when exactly one side is a Mac, e.g. so that Ctrl+C on Windows copies with Cmd+C on the Mac</property>
+                        <property name="header-suffix">
+                          <object class="GtkButton">
+                            <signal name="clicked" handler="handle_mac_keys_reset" swapped="true"/>
+                            <property name="tooltip-text" translatable="yes">swap Ctrl and Cmd again, nothing else</property>
+                            <property name="child">
+                              <object class="AdwButtonContent">
+                                <property name="icon-name">edit-undo-symbolic</property>
+                                <property name="label" translatable="yes">Reset</property>
+                              </object>
+                            </property>
+                            <style>
+                              <class name="flat"/>
+                            </style>
+                          </object>
+                        </property>
+                        <child>
+                          <object class="AdwActionRow">
+                            <property name="title" translatable="yes">Mac key swap</property>
+                            <property name="subtitle" translatable="yes">use the key mappings below with Macs</property>
+                            <property name="activatable-widget">mac_keys_switch</property>
+                            <child>
+                              <object class="GtkSwitch" id="mac_keys_switch">
+                                <property name="valign">center</property>
+                              </object>
+                            </child>
+                          </object>
+                        </child>
+                        <child>
+                          <object class="AdwActionRow" id="mac_key_add_row">
+                            <property name="title" translatable="yes">Add mapping</property>
+                            <property name="subtitle" translatable="yes">key here → key on the other side</property>
+                          </object>
+                        </child>
+                      </object>
+                    </child>
+                    <child>
+                      <object class="AdwPreferencesGroup">
+                        <property name="title" translatable="yes">Key Mappings</property>
+                        <child>
+                          <object class="GtkListBox" id="mac_key_list">
+                            <property name="selection-mode">none</property>
+                            <child type="placeholder">
+                              <object class="AdwActionRow" id="mac_key_placeholder">
+                                <property name="title">no keys are mapped</property>
+                                <property name="subtitle">every key is sent as it is</property>
+                              </object>
+                            </child>
+                            <style>
+                              <class name="boxed-list" />
+                            </style>
                           </object>
                         </child>
                       </object>

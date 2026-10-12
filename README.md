@@ -349,8 +349,10 @@ for information on how to use a specific command.
 <details>
     <summary>Device Discovery</summary>
 
-Lan Mouse advertises itself on the local network via mDNS (Bonjour) and lists
-other Lan Mouse devices it finds, so they can be added without typing a hostname or IP address:
+Lan Mouse advertises itself on the local network and lists other Lan Mouse devices
+it finds, so they can be added without typing a hostname or IP address.
+Devices are found via mDNS (Bonjour) and, for routers that filter multicast
+between Wi-Fi and Ethernet, via broadcast messages on UDP port `4241`:
 
 ```sh
 # list nearby devices
@@ -366,7 +368,7 @@ up to date automatically, e.g. when the device gets a new IP address from DHCP.
 `authorize-discovered` trusts the fingerprint the device announces on the network,
 so only use it on networks you trust (`discover` lists the fingerprints to compare).
 
-Discovery needs UDP port `5353` (mDNS) to be allowed in the firewall.
+Discovery needs UDP ports `5353` (mDNS) and `4241` (broadcast) to be allowed in the firewall.
 It can be turned off with `discovery = false` in the [configuration](#configuration).
 
 </details>
@@ -423,6 +425,30 @@ port = 4242
 # advertise this device and discover others via mDNS (defaults to true)
 discovery = true
 
+# share the clipboard (text) with connected devices, over TLS on the
+# Lan Mouse port via TCP (defaults to true)
+clipboard = true
+
+# how far the mouse has to keep pushing against a screen edge before it
+# moves to the other device, in pixels; 0 crosses right away (defaults to 150)
+edge_resistance = 150
+
+# Windows: pause mouse sharing while a game is in the foreground (defaults to true).
+# Games are detected automatically (Windows' game list, game launchers, exclusive
+# fullscreen); game_programs adds more by executable name.
+pause_for_games = true
+game_programs = ["MyGame.exe"]
+
+# adapt keys when exactly one side is a Mac (defaults to true) ...
+mac_keys = true
+# ... as "key here" -> "key on the other side" (defaults to swapping Ctrl and Cmd)
+mac_key_map = [
+    ["KeyLeftCtrl", "KeyLeftMeta"],
+    ["KeyLeftMeta", "KeyLeftCtrl"],
+    ["KeyRightCtrl", "KeyRightmeta"],
+    ["KeyRightmeta", "KeyRightCtrl"],
+]
+
 # list of authorized tls certificate fingerprints that
 # are accepted for incoming traffic
 [authorized_fingerprints]
@@ -464,11 +490,11 @@ Where `left` can be either `left`, `right`, `top` or `bottom`.
 - [x] MacOS Input Capture
 - [x] Windows Input Capture
 - [x] Encryption
-- [x] Device discovery via mDNS (cli only for now)
+- [x] Device discovery via mDNS and broadcast (cli only for now)
 - [ ] X11 Input Capture
 - [ ] Latency measurement and visualization
 - [ ] Bandwidth usage measurement and visualization
-- [ ] Clipboard support
+- [x] Clipboard support (text)
 
 
 ## Detailed OS Support
