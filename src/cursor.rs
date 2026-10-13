@@ -15,6 +15,13 @@ pub(crate) fn position_along_edge(edge: Position) -> Option<f64> {
     Some(along_edge(edge, screen, x, y))
 }
 
+/// whether the screen is off because the device sleeps. A sleeping Mac wakes
+/// up now and then with the screen off (Power Nap, maintenance) and answers
+/// on the network meanwhile; nobody can use it like that.
+pub(crate) fn display_asleep() -> bool {
+    platform::display_asleep()
+}
+
 /// put the pointer at `along` (0..1) of `edge` of the outermost screen on
 /// that side, so it enters where it left the other device
 pub(crate) fn move_to_edge(edge: Position, along: f64) {
@@ -360,6 +367,11 @@ mod platform {
         let _ = unsafe { SetCursorPos(x.round() as i32, y.round() as i32) };
     }
 
+    /// input wakes a Windows screen up, so it is never too asleep to use
+    pub(super) fn display_asleep() -> bool {
+        false
+    }
+
     #[cfg(test)]
     mod tests {
         use std::{thread::sleep, time::Duration};
@@ -472,9 +484,14 @@ mod platform {
         unsafe { CGWarpMouseCursorPosition(CGPoint { x, y }) };
     }
 
+    pub(super) fn display_asleep() -> bool {
+        unsafe { CGDisplayIsAsleep(CGMainDisplayID()) != 0 }
+    }
+
     #[link(name = "CoreGraphics", kind = "framework")]
     unsafe extern "C" {
         fn CGMainDisplayID() -> u32;
+        fn CGDisplayIsAsleep(display: u32) -> u32;
         fn CGDisplayHideCursor(display: u32) -> i32;
         fn CGDisplayShowCursor(display: u32) -> i32;
         fn CGEventCreate(source: *const c_void) -> *mut c_void;
@@ -610,6 +627,10 @@ mod platform {
     }
 
     pub(super) fn move_pointer(_x: f64, _y: f64) {}
+
+    pub(super) fn display_asleep() -> bool {
+        false
+    }
 }
 
 #[cfg(test)]

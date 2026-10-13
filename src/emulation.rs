@@ -165,6 +165,12 @@ impl ListenTask {
                                 self.listener.reply(addr, ProtoEvent::Leave(0, None)).await;
                             }
                             ProtoEvent::Input(_) if self.game.active() => {}
+                            // the screen is off: this device sleeps, maybe just woke up
+                            // for a moment, and nobody would see where the mouse went
+                            ProtoEvent::Enter(..) if cursor::display_asleep() => {
+                                log::info!("not letting {addr} in: the screen is asleep");
+                                self.listener.reply(addr, ProtoEvent::Leave(0, None)).await;
+                            }
                             ProtoEvent::Enter(pos, along) => {
                                 // come in at the height / width the mouse left the other device
                                 if let Some(along) = along {
@@ -185,10 +191,13 @@ impl ListenTask {
                                 self.listener.reply(addr, ProtoEvent::Ack(0)).await;
                             }
                             ProtoEvent::Input(event) => self.emulation_proxy.consume(event, addr),
-                            // not accepting input while a game is in the foreground,
-                            // so the other device stops capturing at its screen edge
+                            // not accepting input while a game is in the foreground or
+                            // the screen is asleep, so the other device stops capturing
+                            // at its screen edge
                             ProtoEvent::Ping => {
-                                let accepting = self.emulation_proxy.emulation_active.get() && !self.game.active();
+                                let accepting = self.emulation_proxy.emulation_active.get()
+                                    && !self.game.active()
+                                    && !cursor::display_asleep();
                                 self.listener.reply(addr, ProtoEvent::Pong(accepting)).await;
                             }
                             // Peer's version handshake. Echo our own

@@ -48,7 +48,12 @@ fn main() {
 
     // init logging
     let env = Env::default().filter_or("LAN_MOUSE_LOG_LEVEL", "info");
-    env_logger::init_from_env(env);
+    let mut logger = env_logger::Builder::from_env(env);
+    #[cfg(windows)]
+    if let Some(file) = log_file() {
+        logger.target(env_logger::Target::Pipe(Box::new(file)));
+    }
+    logger.init();
 
     if let Err(e) = run() {
         log::error!("{e}");
@@ -149,6 +154,27 @@ fn attach_parent_console() {
     if std::env::args_os().len() > 1 {
         unsafe { AttachConsole(ATTACH_PARENT_PROCESS) };
     }
+}
+
+/// Without a console (started as an app, or the service such an app starts)
+/// log messages would go nowhere, so they go to a file next to the config,
+/// started fresh each time: `lan-mouse.log` for the service and
+/// `lan-mouse-window.log` for the window.
+#[cfg(windows)]
+fn log_file() -> Option<std::fs::File> {
+    use windows_sys::Win32::System::Console::GetConsoleWindow;
+    if !unsafe { GetConsoleWindow() }.is_null() {
+        return None;
+    }
+    let dir = std::path::PathBuf::from(std::env::var_os("LOCALAPPDATA")?).join("lan-mouse");
+    std::fs::create_dir_all(&dir).ok()?;
+    let service = std::env::args().skip(1).any(|arg| arg == "daemon");
+    let name = if service {
+        "lan-mouse.log"
+    } else {
+        "lan-mouse-window.log"
+    };
+    std::fs::File::create(dir.join(name)).ok()
 }
 
 fn start_service() -> Result<Child, io::Error> {
