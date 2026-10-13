@@ -11,6 +11,7 @@
 > - hiding the pointer on the device not in use, entering at the same height
 > - Mac key adaptation (Ctrl/Cmd swap, configurable in the window), reverse scrolling
 > - pausing while a game is in the foreground (Windows)
+> - a tray icon on Windows, where closing or minimizing the window keeps Lan Mouse running (upstream [#467](https://github.com/feschber/lan-mouse/pull/467) by inaiii, included here before it is merged upstream)
 >
 > These changes were written with the help of AI (Anthropic's Claude) and tested on Windows 11 and macOS only. The new settings are documented in the configuration section below.
 
