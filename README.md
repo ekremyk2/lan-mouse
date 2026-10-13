@@ -346,8 +346,8 @@ If the device still can not be entered, make sure you have UDP port `4242` (or t
 #### Tray icon (Windows)
 
 On Windows, Lan Mouse runs as a notification-area application:
-Closing the window only hides it and Lan Mouse keeps running in the tray,
-where the icon offers a menu to re-open the window or quit the app entirely.
+Closing or minimizing the window only hides it and Lan Mouse keeps running in the tray,
+where clicking the icon brings the window back and its menu can also quit the app entirely.
 Launching `lan-mouse` again opens a separate window.
 Set `LAN_MOUSE_HIDDEN=1` in the environment to start quietly into the tray without opening the window.
 </details>

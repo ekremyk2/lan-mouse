@@ -150,7 +150,7 @@ pub fn setup(app: &adw::Application, window: &Window) -> bool {
         async move {
             while let Ok(event) = rx.recv().await {
                 match event {
-                    TrayEvent::Open => window.present(),
+                    TrayEvent::Open => crate::show_window(&window),
                     TrayEvent::Quit => app.quit(),
                 }
             }

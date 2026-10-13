@@ -200,10 +200,17 @@ fn setup_menu(app: &adw::Application) {
     app.set_menubar(Some(&menu))
 }
 
+/// bring the window back, also when it was minimized before it was hidden
+pub(crate) fn show_window(window: &impl IsA<gtk::Window>) {
+    let window = window.as_ref();
+    window.unminimize();
+    window.present();
+}
+
 fn build_ui(app: &Application) {
     // If a window already exists (re-activation), just present it
     if let Some(window) = app.windows().first() {
-        window.present();
+        show_window(window);
         return;
     }
 
@@ -296,6 +303,47 @@ fn build_ui(app: &Application) {
             window.connect_close_request(|window| {
                 window.set_visible(false);
                 glib::Propagation::Stop
+            });
+            // minimizing puts the window into the tray too, not the taskbar
+            window.connect_realize(|window| {
+                let Some(toplevel) = window
+                    .surface()
+                    .and_then(|surface| surface.downcast::<gtk::gdk::Toplevel>().ok())
+                else {
+                    return;
+                };
+                let is_minimized = |toplevel: &gtk::gdk::Toplevel| {
+                    toplevel
+                        .state()
+                        .contains(gtk::gdk::ToplevelState::MINIMIZED)
+                };
+                let was_minimized = std::cell::Cell::new(false);
+                toplevel.connect_state_notify(clone!(
+                    #[weak]
+                    window,
+                    move |toplevel| {
+                        // only when it just got minimized: while it is restored
+                        // from the tray it still counts as minimized for a moment
+                        let minimized = is_minimized(toplevel);
+                        let just_minimized = minimized && !was_minimized.get();
+                        was_minimized.set(minimized);
+                        if !just_minimized || !window.is_visible() {
+                            return;
+                        }
+                        // hide after the state change is handled, not in the middle of it
+                        glib::idle_add_local_once(clone!(
+                            #[weak]
+                            window,
+                            #[weak]
+                            toplevel,
+                            move || {
+                                if is_minimized(&toplevel) {
+                                    window.set_visible(false);
+                                }
+                            }
+                        ));
+                    }
+                ));
             });
         }
         tray_active
