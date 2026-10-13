@@ -357,6 +357,7 @@ impl Window {
         self.request_mac_keys(mac_keys);
     }
 
+    /// the switches in "General" (besides the port) map 1:1 to service settings
     fn setup_clipboard(&self) {
         self.imp().clipboard_switch.connect_active_notify(clone!(
             #[weak(rename_to = window)]
@@ -367,12 +368,30 @@ impl Window {
                 }
             }
         ));
+        self.imp()
+            .reverse_scroll_switch
+            .connect_active_notify(clone!(
+                #[weak(rename_to = window)]
+                self,
+                move |switch| {
+                    if !window.imp().updating_clipboard.get() {
+                        window.request(FrontendRequest::SetReverseScroll(switch.is_active()));
+                    }
+                }
+            ));
     }
 
     pub(super) fn set_clipboard_sharing(&self, enabled: bool) {
         let imp = self.imp();
         imp.updating_clipboard.set(true);
         imp.clipboard_switch.set_active(enabled);
+        imp.updating_clipboard.set(false);
+    }
+
+    pub(super) fn set_reverse_scroll(&self, reverse: bool) {
+        let imp = self.imp();
+        imp.updating_clipboard.set(true);
+        imp.reverse_scroll_switch.set_active(reverse);
         imp.updating_clipboard.set(false);
     }
 

@@ -311,6 +311,8 @@ pub enum FrontendEvent {
     MacKeys(MacKeys),
     /// whether the clipboard is shared with connected devices
     ClipboardSharing(bool),
+    /// whether this mouse scrolls the other way on other devices
+    ReverseScroll(bool),
 }
 
 #[derive(Debug, Eq, PartialEq, Clone, Serialize, Deserialize)]
@@ -361,6 +363,8 @@ pub enum FrontendRequest {
     SetMacKeys(MacKeys),
     /// turn clipboard sharing on or off
     SetClipboardSharing(bool),
+    /// scroll the other way on other devices, or not
+    SetReverseScroll(bool),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]

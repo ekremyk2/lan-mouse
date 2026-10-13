@@ -65,7 +65,6 @@ enum ProducerEvent {
     Release,
     Create(Position),
     Destroy(Position),
-    Grab(Position),
     EventTapDisabled,
     DisplayReconfigured,
 }
@@ -139,13 +138,9 @@ impl InputCaptureState {
         CGDisplay::warp_mouse_cursor_position(pos).map_err(CaptureError::WarpCursor)
     }
 
-    fn hide_cursor(&self) -> Result<(), CaptureError> {
-        CGDisplay::hide_cursor(&CGDisplay::main()).map_err(CaptureError::CoreGraphics)
-    }
-
-    fn show_cursor(&self) -> Result<(), CaptureError> {
-        CGDisplay::show_cursor(&CGDisplay::main()).map_err(CaptureError::CoreGraphics)
-    }
+    // The pointer is not hidden here: the service hides it once the mouse
+    // really crosses over, so while it pushes against the edge it stays
+    // visible, held at the edge.
 
     async fn handle_producer_event(
         &mut self,
@@ -154,38 +149,22 @@ impl InputCaptureState {
         log::debug!("handling event: {producer_event:?}");
         match producer_event {
             ProducerEvent::Release => {
-                if self.current_pos.is_some() {
-                    self.show_cursor()?;
-                    self.current_pos = None;
-                }
-            }
-            ProducerEvent::Grab(pos) => {
-                if self.current_pos.is_none() {
-                    self.hide_cursor()?;
-                    self.current_pos = Some(pos);
-                }
+                self.current_pos = None;
             }
             ProducerEvent::Create(p) => {
                 self.active_clients.insert(p);
             }
             ProducerEvent::Destroy(p) => {
-                if let Some(current) = self.current_pos {
-                    if current == p {
-                        self.show_cursor()?;
-                        self.current_pos = None;
-                    };
+                if self.current_pos == Some(p) {
+                    self.current_pos = None;
                 }
                 self.active_clients.remove(&p);
             }
             ProducerEvent::EventTapDisabled => {
                 // Tap death can happen mid-capture (TCC Accessibility
-                // revoked, tap-timeout, etc). Release state so we
-                // don't leave the cursor hidden even if the outer
-                // task only logs this error rather than propagating.
-                if self.current_pos.is_some() {
-                    self.show_cursor()?;
-                    self.current_pos = None;
-                }
+                // revoked, tap-timeout, etc). Release state even if the
+                // outer task only logs this error rather than propagating.
+                self.current_pos = None;
                 return Err(CaptureError::EventTapDisabled);
             }
             ProducerEvent::DisplayReconfigured => {
@@ -480,10 +459,7 @@ fn create_event_tap<'a>(
             // notify the producer loop so the service can tear
             // down cleanly.
             log::error!("CGEventTap disabled by user input, releasing capture state");
-            if state.current_pos.is_some() {
-                let _ = CGDisplay::show_cursor(&CGDisplay::main());
-                state.current_pos = None;
-            }
+            state.current_pos = None;
             notify_tx
                 .blocking_send(ProducerEvent::EventTapDisabled)
                 .unwrap_or_else(|e| {
@@ -505,7 +481,7 @@ fn create_event_tap<'a>(
                 log::error!("Failed to get events: {e}");
             });
 
-            // Keep (hidden) cursor at the edge of the screen
+            // Keep the cursor at the edge of the screen
             if matches!(
                 event_type,
                 CGEventType::MouseMoved
@@ -522,10 +498,9 @@ fn create_event_tap<'a>(
                 state
                     .start_capture(cg_ev, new_pos)
                     .unwrap_or_else(|e| log::warn!("{e}"));
+                // set right away, so the next move is not taken for another crossing
+                state.current_pos = Some(new_pos);
                 res_events.push(CaptureEvent::Begin);
-                notify_tx
-                    .blocking_send(ProducerEvent::Grab(new_pos))
-                    .expect("Failed to send notification");
             }
         }
 
@@ -700,8 +675,6 @@ impl MacOSInputCapture {
                     _ = &mut tap_exit_rx => break,
                 }
             }
-            // show cursor
-            let _ = CGDisplay::show_cursor(&CGDisplay::main());
         });
 
         Ok(Self {

@@ -1,5 +1,19 @@
 # Lan Mouse
 
+> [!NOTE]
+> This is an unofficial fork of [feschber/lan-mouse](https://github.com/feschber/lan-mouse), not affiliated with the original project. All credit for Lan Mouse itself goes to its authors.
+>
+> It adds, mainly for a Windows PC and a Mac used side by side:
+> - finding other devices on the network automatically (mDNS, plus broadcast for routers that filter multicast)
+> - controlling each other both ways, taking control back when the other side disconnects
+> - a shared clipboard for text, images and files
+> - edge resistance (keep pushing to cross over) with a glow at the screen edge
+> - hiding the pointer on the device not in use, entering at the same height
+> - Mac key adaptation (Ctrl/Cmd swap, configurable in the window), reverse scrolling
+> - pausing while a game is in the foreground (Windows)
+>
+> These changes were written with the help of AI (Anthropic's Claude) and tested on Windows 11 and macOS only. The new settings are documented in the configuration section below.
+
 [![CI](https://github.com/feschber/lan-mouse/actions/workflows/rust.yml/badge.svg)](https://github.com/feschber/lan-mouse/actions/workflows/rust.yml) [![Cachix](https://github.com/feschber/lan-mouse/actions/workflows/cachix.yml/badge.svg)](https://github.com/feschber/lan-mouse/actions/workflows/cachix.yml) [![Release](https://github.com/feschber/lan-mouse/actions/workflows/release.yml/badge.svg)](https://github.com/feschber/lan-mouse/actions/workflows/release.yml)
 
 [![crates.io](https://img.shields.io/crates/v/lan-mouse.svg)](https://crates.io/crates/lan-mouse)  [![license](https://img.shields.io/crates/l/lan-mouse.svg)](https://github.com/feschber/lan-mouse/blob/main/Cargo.toml)
@@ -425,13 +439,23 @@ port = 4242
 # advertise this device and discover others via mDNS (defaults to true)
 discovery = true
 
-# share the clipboard (text) with connected devices, over TLS on the
-# Lan Mouse port via TCP (defaults to true)
+# share the clipboard (text, images, files and folders) with connected
+# devices, over TLS on the Lan Mouse port via TCP (defaults to true)
 clipboard = true
+# copied files are sent right away up to this total size in MB, received
+# files are kept in a temporary folder (defaults to 512, 0 shares no files)
+clipboard_file_limit = 512
 
 # how far the mouse has to keep pushing against a screen edge before it
 # moves to the other device, in pixels; 0 crosses right away (defaults to 150)
 edge_resistance = 150
+# Windows and macOS: a glow at the edge while pushing, and a flash when
+# crossing over (defaults to true)
+edge_indicator = true
+# hide the mouse pointer on the device not in use (defaults to true)
+hide_cursor = true
+# this mouse scrolls the other way while it is on another device (defaults to false)
+reverse_scroll = false
 
 # Windows: pause mouse sharing while a game is in the foreground (defaults to true).
 # Games are detected automatically (Windows' game list, game launchers, exclusive

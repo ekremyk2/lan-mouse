@@ -1,5 +1,5 @@
 use crate::config::local_commit;
-use crate::cursor::CursorHider;
+use crate::cursor::{self, CursorHider};
 use crate::game::GameState;
 use crate::listen::{LanMouseListener, ListenEvent, ListenerCreationError};
 use futures::StreamExt;
@@ -70,7 +70,8 @@ pub(crate) enum EmulationEvent {
 
 enum EmulationRequest {
     Reenable,
-    Release(SocketAddr),
+    /// hand the mouse back to the device at `addr`, with where along the edge it left
+    Release(SocketAddr, Option<f64>),
     ChangePort(u16),
     Terminate,
 }
@@ -101,9 +102,9 @@ impl Emulation {
         }
     }
 
-    pub(crate) fn send_leave_event(&self, addr: SocketAddr) {
+    pub(crate) fn send_leave_event(&self, addr: SocketAddr, along: Option<f64>) {
         self.request_tx
-            .send(EmulationRequest::Release(addr))
+            .send(EmulationRequest::Release(addr, along))
             .expect("channel closed");
     }
 
@@ -159,12 +160,16 @@ impl ListenTask {
                         last_response.insert(addr, Instant::now());
                         match event {
                             // a game is in the foreground: send the other device's mouse right back
-                            ProtoEvent::Enter(_) if self.game.active() => {
+                            ProtoEvent::Enter(..) if self.game.active() => {
                                 log::debug!("not letting {addr} in: a game is in the foreground");
-                                self.listener.reply(addr, ProtoEvent::Leave(0)).await;
+                                self.listener.reply(addr, ProtoEvent::Leave(0, None)).await;
                             }
                             ProtoEvent::Input(_) if self.game.active() => {}
-                            ProtoEvent::Enter(pos) => {
+                            ProtoEvent::Enter(pos, along) => {
+                                // come in at the height / width the mouse left the other device
+                                if let Some(along) = along {
+                                    cursor::move_to_edge(pos, along);
+                                }
                                 self.cursor.show();
                                 if let Some(fingerprint) = self.listener.get_certificate_fingerprint(addr).await {
                                     log::info!("releasing capture: {addr} entered this device");
@@ -173,9 +178,9 @@ impl ListenTask {
                                     self.event_tx.send(EmulationEvent::Entered{addr, pos: to_ipc_pos(pos), fingerprint}).expect("channel closed");
                                 }
                             }
-                            ProtoEvent::Leave(_) => {
+                            ProtoEvent::Leave(..) => {
                                 // the user went back to the other device
-                                self.cursor.hide();
+                                self.cursor.hide_until_moved();
                                 self.emulation_proxy.remove(addr);
                                 self.listener.reply(addr, ProtoEvent::Ack(0)).await;
                             }
@@ -223,7 +228,7 @@ impl ListenTask {
                     if self.game.active() {
                         for &addr in last_response.keys() {
                             self.emulation_proxy.remove(addr);
-                            self.listener.reply(addr, ProtoEvent::Leave(0)).await;
+                            self.listener.reply(addr, ProtoEvent::Leave(0, None)).await;
                         }
                     }
                 }
@@ -231,7 +236,7 @@ impl ListenTask {
                     // reenable emulation
                     EmulationRequest::Reenable => self.emulation_proxy.reenable(),
                     // notify the other end that we hit a barrier (should release capture)
-                    EmulationRequest::Release(addr) => self.listener.reply(addr, ProtoEvent::Leave(0)).await,
+                    EmulationRequest::Release(addr, along) => self.listener.reply(addr, ProtoEvent::Leave(0, along)).await,
                     EmulationRequest::ChangePort(port) => {
                         self.listener.request_port_change(port);
                         let result = self.listener.port_changed().await;

@@ -48,6 +48,8 @@ pub struct Window {
     #[template_child]
     pub authorized_list: TemplateChild<ListBox>,
     #[template_child]
+    pub reverse_scroll_switch: TemplateChild<Switch>,
+    #[template_child]
     pub clipboard_switch: TemplateChild<Switch>,
     /// set while the switch is updated from the service, so that doesn't
     /// count as the user flipping it

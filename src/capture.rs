@@ -17,7 +17,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     connect::{ConnectionEvent, LanMouseConnection},
-    cursor::CursorHider,
+    cursor::{self, CursorHider},
+    edge_indicator::EdgeIndicator,
     game::GameState,
 };
 use lan_mouse_ipc::MacKeys;
@@ -36,8 +37,9 @@ pub(crate) struct Capture {
 }
 
 pub(crate) enum ICaptureEvent {
-    /// a client was entered
-    CaptureBegin(CaptureHandle),
+    /// the mouse crossed the edge of the given capture, with where along
+    /// the edge (0..1) it crossed
+    CaptureBegin(CaptureHandle, Option<f64>),
     /// capture disabled
     CaptureDisabled,
     /// capture disabled
@@ -82,18 +84,35 @@ enum CaptureRequest {
     SetReleaseBind(Vec<scancode::Linux>),
     /// change how keys are adapted for Macs
     SetMacKeys(MacKeys),
+    /// scroll the other way on other devices, or not
+    SetReverseScroll(bool),
+}
+
+/// how capturing behaves, from the config
+pub(crate) struct CaptureOptions {
+    pub(crate) release_bind: Vec<scancode::Linux>,
+    pub(crate) mac_keys: MacKeys,
+    /// how far the mouse has to push against an edge to cross over (px)
+    pub(crate) edge_resistance: u32,
+    /// scroll the other way on other devices
+    pub(crate) reverse_scroll: bool,
 }
 
 impl Capture {
     pub(crate) fn new(
         backend: Option<input_capture::Backend>,
         conn: LanMouseConnection,
-        release_bind: Vec<scancode::Linux>,
+        options: CaptureOptions,
         game: GameState,
-        mac_keys: MacKeys,
-        edge_resistance: u32,
         cursor: CursorHider,
+        indicator: EdgeIndicator,
     ) -> Self {
+        let CaptureOptions {
+            release_bind,
+            mac_keys,
+            edge_resistance,
+            reverse_scroll,
+        } = options;
         let (request_tx, request_rx) = channel();
         let (event_tx, event_rx) = channel();
         let cancellation_token = CancellationToken::new();
@@ -105,7 +124,10 @@ impl Capture {
             mac_keys: mac_keys.into(),
             edge_resistance: edge_resistance as f64,
             edge_push: None,
+            enter_along: None,
+            reverse_scroll,
             cursor,
+            indicator,
             backend,
             cancellation_token: cancellation_token.clone(),
             captures: Default::default(),
@@ -173,6 +195,12 @@ impl Capture {
     pub(crate) fn set_mac_keys(&self, mac_keys: MacKeys) {
         let _ = self.request_tx.send(CaptureRequest::SetMacKeys(mac_keys));
     }
+
+    pub(crate) fn set_reverse_scroll(&self, reverse: bool) {
+        let _ = self
+            .request_tx
+            .send(CaptureRequest::SetReverseScroll(reverse));
+    }
 }
 
 /// debounce a statement `$st`, i.e. the statement is executed only if the
@@ -208,8 +236,14 @@ struct CaptureTask {
     /// how far the mouse has to push against an edge to cross over (px)
     edge_resistance: f64,
     edge_push: Option<EdgePush>,
+    /// where along the edge the mouse crossed over (0..1)
+    enter_along: Option<f64>,
+    /// scroll the other way on other devices
+    reverse_scroll: bool,
     /// hides the local pointer while the mouse is on another device
     cursor: CursorHider,
+    /// glows at the edge the mouse pushes against
+    indicator: EdgeIndicator,
     backend: Option<input_capture::Backend>,
     cancellation_token: CancellationToken,
     captures: Vec<(CaptureHandle, Position, CaptureType)>,
@@ -255,6 +289,21 @@ impl CaptureTask {
         match event {
             Event::Keyboard(event) if self.adapts_mac_keys(handle) => {
                 Event::Keyboard(self.mac_keys.event(event))
+            }
+            Event::Pointer(PointerEvent::Axis { time, axis, value }) if self.reverse_scroll => {
+                Event::Pointer(PointerEvent::Axis {
+                    time,
+                    axis,
+                    value: -value,
+                })
+            }
+            Event::Pointer(PointerEvent::AxisDiscrete120 { axis, value })
+                if self.reverse_scroll =>
+            {
+                Event::Pointer(PointerEvent::AxisDiscrete120 {
+                    axis,
+                    value: -value,
+                })
             }
             event => event,
         }
@@ -360,6 +409,7 @@ impl CaptureTask {
                             self.release_bind.borrow_mut().clone_from(&bind);
                         }
                         CaptureRequest::SetMacKeys(mac_keys) => self.mac_keys = mac_keys.into(),
+                        CaptureRequest::SetReverseScroll(reverse) => self.reverse_scroll = reverse,
                     },
                     _ = self.cancellation_token.cancelled() => return,
                 }
@@ -457,9 +507,14 @@ impl CaptureTask {
                             self.state = State::Sending;
                         }
                         // client disconnected
-                        ProtoEvent::Leave(_) => {
+                        ProtoEvent::Leave(_, along) => {
                             log::info!("releasing capture: left remote client device region");
+                            // the pointer comes back at the height / width it left the other device
+                            let edge = self.active_client.map(|h| to_proto_pos(self.get_pos(h)));
                             self.release_capture(capture).await?;
+                            if let (Some(edge), Some(along)) = (edge, along) {
+                                cursor::move_to_edge(edge, along);
+                            }
                         },
                         _ => {}
                     }
@@ -504,6 +559,7 @@ impl CaptureTask {
                         self.release_capture(capture).await?;
                         self.mac_keys = mac_keys.into();
                     }
+                    CaptureRequest::SetReverseScroll(reverse) => self.reverse_scroll = reverse,
                 },
                 _ = self.cancellation_token.cancelled() => break,
             }
@@ -524,26 +580,18 @@ impl CaptureTask {
             return self.release_capture(capture).await;
         }
 
-        if event == CaptureEvent::Begin {
-            self.event_tx
-                .send(ICaptureEvent::CaptureBegin(handle))
-                .expect("channel closed");
-        }
-
+        let pos = self.get_pos(handle);
         // enter only capture (for incoming connections)
-        if self.get_type(handle) == CaptureType::EnterOnly {
-            // if there is no active outgoing connection at the current capture,
-            // we release the capture
-            if !self.is_default_capture_at(self.get_pos(handle)) {
-                log::info!("releasing capture: no active client at this position");
-                capture.release().await?;
-            }
-            // we dont care about events from incoming handles except for releasing the capture
+        let enter_only = self.get_type(handle) == CaptureType::EnterOnly;
+        // every capture at an edge gets each event: an edge with a client is
+        // handled through the client's capture, so it is pushed only once
+        if enter_only && self.is_default_capture_at(pos) {
             return Ok(());
         }
 
-        // resist crossing over: only switch to the client once the mouse
-        // kept pushing against the edge, so brushing it does nothing
+        // resist crossing over: only switch to the client, or hand an incoming
+        // device's mouse back to it, once the mouse kept pushing against the
+        // edge, so brushing it does nothing
         if self.active_client != Some(handle) && self.edge_resistance > 0.0 {
             match event {
                 CaptureEvent::Begin => {
@@ -552,10 +600,12 @@ impl CaptureTask {
                         distance: 0.0,
                         last_progress: Instant::now(),
                     });
+                    self.indicator.push(self.get_pos(handle), 0.0);
                     return Ok(());
                 }
                 CaptureEvent::Input(Event::Pointer(PointerEvent::Motion { dx, dy, .. })) => {
-                    let outward = outward_motion(self.get_pos(handle), dx, dy);
+                    let pos = self.get_pos(handle);
+                    let outward = outward_motion(pos, dx, dy);
                     let Some(push) = self.edge_push.as_mut().filter(|push| push.handle == handle)
                     else {
                         return self.release_capture(capture).await;
@@ -570,6 +620,8 @@ impl CaptureTask {
                         return self.release_capture(capture).await;
                     }
                     if push.distance < self.edge_resistance {
+                        self.indicator
+                            .push(pos, push.distance / self.edge_resistance);
                         return Ok(());
                     }
                     log::debug!(
@@ -579,6 +631,14 @@ impl CaptureTask {
                     self.edge_push = None;
                     event = CaptureEvent::Begin;
                 }
+                // letting go of a key or button is no reason to stay, nor is a
+                // modifier update (sent along when another device releases its mouse)
+                CaptureEvent::Input(Event::Keyboard(
+                    KeyboardEvent::Key { state: 0, .. } | KeyboardEvent::Modifiers { .. },
+                ))
+                | CaptureEvent::Input(Event::Pointer(PointerEvent::Button { state: 0, .. })) => {
+                    return Ok(());
+                }
                 // clicking, scrolling or typing: the user wants to stay here
                 _ => {
                     self.edge_push = None;
@@ -587,11 +647,29 @@ impl CaptureTask {
             }
         }
 
+        if event == CaptureEvent::Begin {
+            self.hand_back_incoming(pos);
+        }
+
+        if enter_only {
+            // no client at this edge, the mouse stays on this device
+            log::info!("releasing capture: no active client at this position");
+            if event == CaptureEvent::Begin {
+                self.indicator.crossed(pos);
+            } else {
+                self.indicator.cancel();
+            }
+            return capture.release().await;
+        }
+
         // activated a new client
         if event == CaptureEvent::Begin && Some(handle) != self.active_client {
             self.state = State::WaitingForAck;
             self.active_client.replace(handle);
+            // the other device enters at the same relative height / width
+            self.enter_along = cursor::position_along_edge(to_proto_pos(self.get_pos(handle)));
             self.cursor.hide();
+            self.indicator.crossed(self.get_pos(handle));
             self.event_tx
                 .send(ICaptureEvent::ClientEntered(handle))
                 .expect("channel closed");
@@ -600,10 +678,10 @@ impl CaptureTask {
         let opposite_pos = to_proto_pos(self.get_pos(handle).opposite());
 
         let event = match event {
-            CaptureEvent::Begin => ProtoEvent::Enter(opposite_pos),
+            CaptureEvent::Begin => ProtoEvent::Enter(opposite_pos, self.enter_along),
             CaptureEvent::Input(e) => match self.state {
                 // connection not acknowledged, repeat `Enter` event
-                State::WaitingForAck => ProtoEvent::Enter(opposite_pos),
+                State::WaitingForAck => ProtoEvent::Enter(opposite_pos, self.enter_along),
                 State::Sending => ProtoEvent::Input(self.adapt_event(handle, e)),
             },
         };
@@ -622,8 +700,24 @@ impl CaptureTask {
         Ok(())
     }
 
+    /// the mouse crossed the edge at `pos`: incoming devices there get their
+    /// mouse back (the service sends them `Leave`), at the same height / width
+    fn hand_back_incoming(&self, pos: Position) {
+        let along = cursor::position_along_edge(to_proto_pos(pos));
+        for &(handle, ..) in self
+            .captures
+            .iter()
+            .filter(|&&(_, p, t)| p == pos && t == CaptureType::EnterOnly)
+        {
+            self.event_tx
+                .send(ICaptureEvent::CaptureBegin(handle, along))
+                .expect("channel closed");
+        }
+    }
+
     async fn release_capture(&mut self, capture: &mut InputCapture) -> Result<(), CaptureError> {
         self.edge_push = None;
+        self.indicator.cancel();
         self.cursor.show();
         // If we have an active client, notify them we're leaving
         if let Some(handle) = self.active_client.take() {
@@ -674,7 +768,7 @@ impl CaptureTask {
             }
 
             log::info!("sending Leave event to client {handle}");
-            if let Err(e) = self.conn.send(ProtoEvent::Leave(0), handle).await {
+            if let Err(e) = self.conn.send(ProtoEvent::Leave(0, None), handle).await {
                 log::warn!("failed to send Leave to client {handle}: {e}");
             }
         }

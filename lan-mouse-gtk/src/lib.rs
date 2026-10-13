@@ -331,6 +331,7 @@ fn build_ui(app: &Application) {
                     FrontendEvent::ClipboardSharing(enabled) => {
                         window.set_clipboard_sharing(enabled)
                     }
+                    FrontendEvent::ReverseScroll(reverse) => window.set_reverse_scroll(reverse),
                 }
             }
         }

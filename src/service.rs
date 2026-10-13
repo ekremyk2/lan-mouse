@@ -1,5 +1,5 @@
 use crate::{
-    capture::{Capture, CaptureType, ICaptureEvent},
+    capture::{Capture, CaptureOptions, CaptureType, ICaptureEvent},
     client::ClientManager,
     clipboard::ClipboardSync,
     config::{Config, ConfigClient},
@@ -8,6 +8,7 @@ use crate::{
     cursor::CursorHider,
     discovery::{self, Discovery, DiscoveryEvent},
     dns::{DnsEvent, DnsResolver},
+    edge_indicator::EdgeIndicator,
     emulation::{Emulation, EmulationEvent},
     game::GameWatch,
     listen::{LanMouseListener, ListenerCreationError},
@@ -116,14 +117,19 @@ impl Service {
 
         // input capture + emulation
         let capture_backend = config.capture_backend().map(|b| b.into());
+        let options = CaptureOptions {
+            release_bind: config.release_bind(),
+            mac_keys: config.mac_keys(),
+            edge_resistance: config.edge_resistance(),
+            reverse_scroll: config.reverse_scroll(),
+        };
         let capture = Capture::new(
             capture_backend,
             conn,
-            config.release_bind(),
+            options,
             game_watch.subscribe(),
-            config.mac_keys(),
-            config.edge_resistance(),
             cursor.clone(),
+            EdgeIndicator::new(config.edge_indicator()),
         );
         let emulation_backend = config.emulation_backend().map(|b| b.into());
         let emulation = Emulation::new(emulation_backend, listener, game_watch.subscribe(), cursor);
@@ -140,6 +146,7 @@ impl Service {
             &cert,
             authorized_keys.clone(),
             client_manager.clone(),
+            config.clipboard_file_limit(),
         ) {
             Ok(clipboard) => Some(clipboard),
             Err(e) => {
@@ -301,6 +308,12 @@ impl Service {
                 self.save_config();
                 self.notify_frontend(FrontendEvent::ClipboardSharing(enabled));
             }
+            FrontendRequest::SetReverseScroll(reverse) => {
+                self.capture.set_reverse_scroll(reverse);
+                self.config.set_reverse_scroll(reverse);
+                self.save_config();
+                self.notify_frontend(FrontendEvent::ReverseScroll(reverse));
+            }
             FrontendRequest::SetMacKeys(mac_keys) => {
                 self.capture.set_mac_keys(mac_keys.clone());
                 self.config.set_mac_keys(&mac_keys);
@@ -350,6 +363,8 @@ impl Service {
         let release_bind = self.config.release_bind();
         self.capture.set_release_bind(release_bind);
         self.capture.set_mac_keys(self.config.mac_keys());
+        self.capture
+            .set_reverse_scroll(self.config.reverse_scroll());
         if let Some(clipboard) = &self.clipboard {
             clipboard.set_enabled(self.config.clipboard());
         }
@@ -433,11 +448,11 @@ impl Service {
 
     fn handle_capture_event(&mut self, event: ICaptureEvent) {
         match event {
-            ICaptureEvent::CaptureBegin(handle) => {
+            ICaptureEvent::CaptureBegin(handle, along) => {
                 // we entered the capture zone for an incoming connection
                 // => notify it that its capture should be released
                 if let Some(incoming) = self.incoming_conn_info.get(&handle) {
-                    self.emulation.send_leave_event(incoming.addr);
+                    self.emulation.send_leave_event(incoming.addr, along);
                 }
             }
             ICaptureEvent::CaptureDisabled => {
@@ -610,6 +625,7 @@ impl Service {
         self.notify_discovered();
         self.notify_frontend(FrontendEvent::MacKeys(self.config.mac_keys()));
         self.notify_frontend(FrontendEvent::ClipboardSharing(self.config.clipboard()));
+        self.notify_frontend(FrontendEvent::ReverseScroll(self.config.reverse_scroll()));
     }
 
     const ENTER_HANDLE_BEGIN: u64 = u64::MAX / 2 + 1;

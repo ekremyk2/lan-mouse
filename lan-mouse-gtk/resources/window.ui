@@ -197,6 +197,19 @@
                           </object>
                         </child>
                         <child>
+                          <object class="AdwActionRow">
+                            <property name="title" translatable="yes">Reverse scrolling on other devices</property>
+                            <property name="subtitle" translatable="yes">this mouse scrolls the other way while it is on another device</property>
+                            <property name="icon-name">view-sort-descending-symbolic</property>
+                            <property name="activatable-widget">reverse_scroll_switch</property>
+                            <child>
+                              <object class="GtkSwitch" id="reverse_scroll_switch">
+                                <property name="valign">center</property>
+                              </object>
+                            </child>
+                          </object>
+                        </child>
+                        <child>
                           <object class="AdwActionRow" id="fingerprint_row">
                             <property name="title">certificate fingerprint</property>
                             <property name="icon-name">auth-fingerprint-symbolic</property>

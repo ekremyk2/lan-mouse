@@ -76,7 +76,10 @@ struct ConfigToml {
     mac_keys: Option<bool>,
     mac_key_map: Option<Vec<(scancode::Linux, scancode::Linux)>>,
     clipboard: Option<bool>,
+    clipboard_file_limit: Option<u64>,
     hide_cursor: Option<bool>,
+    edge_indicator: Option<bool>,
+    reverse_scroll: Option<bool>,
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug, Eq, PartialEq)]
@@ -354,6 +357,8 @@ const DEFAULT_RELEASE_KEYS: [scancode::Linux; 4] =
 
 const DEFAULT_EDGE_RESISTANCE: u32 = 150;
 
+const DEFAULT_CLIPBOARD_FILE_LIMIT_MB: u64 = 512;
+
 impl Config {
     pub fn new() -> Result<Self, ConfigError> {
         let args = Args::parse();
@@ -514,6 +519,28 @@ impl Config {
             .unwrap_or_default()
     }
 
+    /// whether to scroll the other way when this mouse is on another device
+    pub fn reverse_scroll(&self) -> bool {
+        self.config_toml
+            .as_ref()
+            .and_then(|c| c.reverse_scroll)
+            .unwrap_or(false)
+    }
+
+    pub fn set_reverse_scroll(&mut self, reverse: bool) {
+        self.config_toml
+            .get_or_insert_with(Default::default)
+            .reverse_scroll = Some(reverse);
+    }
+
+    /// whether to show a glow at the screen edge while the mouse pushes against it
+    pub fn edge_indicator(&self) -> bool {
+        self.config_toml
+            .as_ref()
+            .and_then(|c| c.edge_indicator)
+            .unwrap_or(true)
+    }
+
     /// whether to hide the mouse pointer on the device that is not in use
     pub fn hide_cursor(&self) -> bool {
         self.config_toml
@@ -528,6 +555,16 @@ impl Config {
             .as_ref()
             .and_then(|c| c.clipboard)
             .unwrap_or(true)
+    }
+
+    /// copied files are shared up to this total size (bytes), 0 turns it off
+    pub fn clipboard_file_limit(&self) -> u64 {
+        let megabytes = self
+            .config_toml
+            .as_ref()
+            .and_then(|c| c.clipboard_file_limit)
+            .unwrap_or(DEFAULT_CLIPBOARD_FILE_LIMIT_MB);
+        megabytes.saturating_mul(1024 * 1024)
     }
 
     pub fn set_clipboard(&mut self, enabled: bool) {

@@ -8,6 +8,7 @@ mod crypto;
 mod cursor;
 mod discovery;
 mod dns;
+mod edge_indicator;
 mod emulation;
 pub mod emulation_test;
 mod game;

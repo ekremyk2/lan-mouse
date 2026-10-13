@@ -75,10 +75,37 @@ tokio-rustls = { version = "0.26.4", default-features = false, features = [
     "ring",
     "logging",
 ] }
-arboard = { version = "3.6.1", default-features = false }
+arboard = { version = "3.6.1", default-features = false, features = ["image-data"] }
+image = { version = "0.25", default-features = false, features = ["png"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2.148"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# the clipboard's change counter and the edge indicator's window, the same
+# crates arboard uses
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3", default-features = false, features = [
+    "std",
+    "NSApplication",
+    "NSColor",
+    "NSEvent",
+    "NSGraphics",
+    "NSPasteboard",
+    "NSResponder",
+    "NSRunningApplication",
+    "NSView",
+    "NSWindow",
+] }
+objc2-foundation = { version = "0.3", default-features = false, features = [
+    "std",
+    "NSDate",
+    "NSGeometry",
+    "NSObjCRuntime",
+    "NSRunLoop",
+    "NSString",
+    "objc2-core-foundation",
+] }
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.61.2", features = [
