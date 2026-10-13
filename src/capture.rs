@@ -124,6 +124,7 @@ impl Capture {
             mac_keys: mac_keys.into(),
             edge_resistance: edge_resistance as f64,
             edge_push: None,
+            awaiting_ack: None,
             enter_along: None,
             reverse_scroll,
             cursor,
@@ -222,10 +223,11 @@ macro_rules! debounce {
 
 struct CaptureTask {
     active_client: Option<CaptureHandle>,
-    /// [`CaptureType::Default`] captures with a barrier in the backend.
-    /// A client is only armed while it is connected and accepts input, so
-    /// an unreachable client never grabs the mouse and a lost connection
-    /// hands it back right away.
+    /// captures with a barrier in the backend. A client is only armed while
+    /// it is connected and accepts input, so an unreachable client never
+    /// grabs the mouse and a lost connection hands it back right away.
+    /// While a game is in the foreground nothing is armed, not even the
+    /// edges that hand an incoming device's mouse back.
     armed: HashSet<CaptureHandle>,
     /// next attempt and current back-off for reaching unarmed clients
     reconnect: HashMap<CaptureHandle, (Instant, Duration)>,
@@ -236,6 +238,8 @@ struct CaptureTask {
     /// how far the mouse has to push against an edge to cross over (px)
     edge_resistance: f64,
     edge_push: Option<EdgePush>,
+    /// when the mouse crossed over to the active client, until it answers
+    awaiting_ack: Option<Instant>,
     /// where along the edge the mouse crossed over (0..1)
     enter_along: Option<f64>,
     /// scroll the other way on other devices
@@ -324,7 +328,11 @@ impl CaptureTask {
         capture: &mut InputCapture,
         handle: CaptureHandle,
     ) -> Result<(), CaptureError> {
-        if self.active_client == Some(handle) {
+        let pushing = self
+            .edge_push
+            .as_ref()
+            .is_some_and(|push| push.handle == handle);
+        if self.active_client == Some(handle) || pushing {
             self.release_capture(capture).await?;
         }
         if self.armed.remove(&handle) {
@@ -335,7 +343,7 @@ impl CaptureTask {
 
     /// arm clients that became ready, disarm unreachable ones and keep
     /// trying to reach those, with growing pauses in between.
-    /// While a game is in the foreground, no client is armed.
+    /// While a game is in the foreground, nothing is armed.
     async fn update_armed(&mut self, capture: &mut InputCapture) -> Result<(), CaptureError> {
         let now = Instant::now();
         let paused = self.game.active();
@@ -372,6 +380,25 @@ impl CaptureTask {
                     *next = now + *delay;
                     *delay = (*delay * 2).min(RECONNECT_DELAY_MAX);
                 }
+            }
+        }
+        // the edges handing an incoming device's mouse back pause for games too
+        let enter_only = self
+            .captures
+            .iter()
+            .filter(|&&(_, _, t)| t == CaptureType::EnterOnly)
+            .map(|&(h, p, _)| (h, p))
+            .collect::<Vec<_>>();
+        for (handle, pos) in enter_only {
+            let armed = self.armed.contains(&handle);
+            if paused && armed {
+                log::debug!(
+                    "game in the foreground, releasing the screen edge of incoming {handle}"
+                );
+                self.disarm(capture, handle).await?;
+            } else if !paused && !armed {
+                self.armed.insert(handle);
+                capture.create(handle, pos).await?;
             }
         }
         Ok(())
@@ -448,11 +475,15 @@ impl CaptureTask {
     async fn create_captures(&mut self, capture: &mut InputCapture) -> Result<(), CaptureError> {
         // clients get armed by `update_armed` once they are ready
         self.armed.clear();
+        if self.game.active() {
+            return Ok(());
+        }
         let captures = self.captures.clone();
         for (handle, pos, capture_type) in captures {
             if capture_type == CaptureType::Default {
                 continue;
             }
+            self.armed.insert(handle);
             tokio::select! {
                 r = capture.create(handle, pos) => r?,
                 _ = self.cancellation_token.cancelled() => return Ok(()),
@@ -481,6 +512,15 @@ impl CaptureTask {
                     self.edge_push = None;
                     self.release_capture(capture).await?;
                 }
+                _ = ack_timeout(self.awaiting_ack) => {
+                    // e.g. the other device just went to sleep: never hold on to
+                    // the mouse and keyboard while waiting for it
+                    self.awaiting_ack = None;
+                    if let Some(handle) = self.active_client {
+                        log::warn!("client {handle} did not answer, giving the mouse back");
+                        self.disarm(capture, handle).await?;
+                    }
+                }
                 event = self.conn.recv() => {
                     let (handle, event) = match event {
                         ConnectionEvent::Event(handle, event) => (handle, event),
@@ -505,6 +545,7 @@ impl CaptureTask {
                         ProtoEvent::Ack(_) => {
                             log::info!("client {handle} acknowledged the connection!");
                             self.state = State::Sending;
+                            self.awaiting_ack = None;
                         }
                         // client disconnected
                         ProtoEvent::Leave(_, along) => {
@@ -527,7 +568,12 @@ impl CaptureTask {
                         match t {
                             // start connecting now, `update_armed` arms it once ready
                             CaptureType::Default => self.conn.connect(h).await,
-                            CaptureType::EnterOnly => capture.create(h, p).await?,
+                            // not while a game is in the foreground, `update_armed` arms it after
+                            CaptureType::EnterOnly if !self.game.active() => {
+                                self.armed.insert(h);
+                                capture.create(h, p).await?;
+                            }
+                            CaptureType::EnterOnly => {}
                         }
                     }
                     CaptureRequest::Destroy(h) => {
@@ -541,11 +587,10 @@ impl CaptureTask {
                         if self.active_client == Some(h) {
                             self.release_capture(capture).await?;
                         }
-                        let has_barrier = self.armed.remove(&h)
-                            || self
-                                .captures
-                                .iter()
-                                .any(|&(c, _, t)| c == h && t == CaptureType::EnterOnly);
+                        if self.edge_push.as_ref().is_some_and(|push| push.handle == h) {
+                            self.release_capture(capture).await?;
+                        }
+                        let has_barrier = self.armed.remove(&h);
                         self.remove_capture(h);
                         if has_barrier {
                             capture.destroy(h).await?;
@@ -665,6 +710,7 @@ impl CaptureTask {
         // activated a new client
         if event == CaptureEvent::Begin && Some(handle) != self.active_client {
             self.state = State::WaitingForAck;
+            self.awaiting_ack = Some(Instant::now());
             self.active_client.replace(handle);
             // the other device enters at the same relative height / width
             self.enter_along = cursor::position_along_edge(to_proto_pos(self.get_pos(handle)));
@@ -717,6 +763,7 @@ impl CaptureTask {
 
     async fn release_capture(&mut self, capture: &mut InputCapture) -> Result<(), CaptureError> {
         self.edge_push = None;
+        self.awaiting_ack = None;
         self.indicator.cancel();
         self.cursor.show();
         // If we have an active client, notify them we're leaving
@@ -791,6 +838,9 @@ enum State {
 const EDGE_PUSH_BACKOFF: f64 = 2.0;
 /// a push is cancelled when the mouse stops pushing against the edge for this long
 const EDGE_PUSH_IDLE: Duration = Duration::from_millis(300);
+/// the mouse comes back when the other device does not answer crossing over
+/// within this time, instead of being held until the connection times out
+const ACK_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// the mouse pushing against a screen edge, not yet far enough to cross over
 struct EdgePush {
@@ -815,6 +865,15 @@ fn outward_motion(pos: Position, dx: f64, dy: f64) -> f64 {
 async fn edge_push_idle(push: &Option<EdgePush>) {
     match push {
         Some(push) => tokio::time::sleep_until((push.last_progress + EDGE_PUSH_IDLE).into()).await,
+        None => std::future::pending().await,
+    }
+}
+
+/// resolves when the client the mouse crossed over to (at `crossed`) did not
+/// answer in time
+async fn ack_timeout(crossed: Option<Instant>) {
+    match crossed {
+        Some(crossed) => tokio::time::sleep_until((crossed + ACK_TIMEOUT).into()).await,
         None => std::future::pending().await,
     }
 }
